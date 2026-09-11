@@ -125,6 +125,24 @@ pub fn encode_mouse_button(
     encode_mouse_cb(button, release, column, row, modifiers, encoding)
 }
 
+/// Encode an xterm mouse-motion report for a legacy external terminal.
+///
+/// Motion uses the standard button code 35 (32 for motion plus the base
+/// code 3), with the same modifier and coordinate encodings as button reports.
+#[allow(dead_code)] // exercised through the external terminal input bridge
+pub fn encode_mouse_motion(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    encoding: MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    if !matches!(kind, MouseEventKind::Moved) {
+        return None;
+    }
+    encode_mouse_cb(35, false, column, row, modifiers, encoding)
+}
+
 #[allow(dead_code)] // only reached through mouse encoding helpers above
 fn encode_mouse_cb(
     base_button: u16,

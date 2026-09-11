@@ -64,7 +64,7 @@ use crate::server::notifications::{
 };
 use crate::server::pane_input::{
     apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
-    apply_terminal_attach_scroll, terminal_attach_mouse_position,
+    apply_terminal_attach_scroll, encode_external_client_input, terminal_attach_mouse_position,
 };
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
@@ -228,7 +228,9 @@ pub struct HeadlessServer {
     server_config_diagnostic: Option<String>,
     /// Server config warning with keybinding diagnostics removed for local-keybinding clients.
     server_config_diagnostic_without_keybindings: Option<String>,
-    /// Writable direct attach owner per terminal id string.
+    /// Controller owner per terminal id string. Direct terminal attachments
+    /// and the first mutating shell client share this fence; observe-only
+    /// clients never acquire it.
     terminal_attach_owners: HashMap<String, u64>,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
@@ -1033,6 +1035,13 @@ impl HeadlessServer {
                 }
             }
         }
+        // Shell clients can become the controller of an external terminal
+        // without entering direct-attach mode.  Release that presentation
+        // ownership on disconnect just as a direct attachment is released;
+        // the Coven lease itself is renewed/taken over by the next admitted
+        // mutation and never by a stale client.
+        self.terminal_attach_owners
+            .retain(|_, owner| *owner != client_id);
         if should_release_focus {
             if let Some(target) = disconnected_focus.as_ref() {
                 self.send_shell_focus_target(target, crate::ghostty::FocusEvent::Lost);
@@ -1183,6 +1192,327 @@ impl HeadlessServer {
             .terminal_runtimes
             .external_session(&terminal_id)
             .cloned()
+    }
+
+    /// Route shell input for one external pane through the same typed worker
+    /// used by the JSON pane API.  The first mutating shell client becomes the
+    /// presentation controller; later clients continue to receive snapshots
+    /// and local scrolling but cannot inject bytes until that owner disconnects
+    /// (or an explicit direct-attach takeover replaces it).
+    fn handle_external_shell_pane_input(
+        &mut self,
+        client_id: u64,
+        terminal_id: String,
+        events: &[protocol::ClientPaneInputEvent],
+    ) -> bool {
+        let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) else {
+            return false;
+        };
+        let Some(session) = self
+            .app
+            .terminal_runtimes
+            .external_session(&real_terminal_id)
+            .cloned()
+        else {
+            return false;
+        };
+
+        let (external_mouse_mode, external_alternate_screen, external_rows) =
+            match session.render_snapshot() {
+                Ok(snapshot) => (
+                    snapshot.modes.mouse,
+                    snapshot.modes.alternate_screen,
+                    i32::from(snapshot.screen_lines.max(1)),
+                ),
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external shell input snapshot failed");
+                return false;
+            }
+        };
+
+        // Scroll is a presentation-only mutation. It is intentionally allowed
+        // for observers when the child has not requested mouse reporting. A
+        // child that enabled mouse reporting receives the wheel event below.
+        let mut changed = false;
+        let mut remote_events = Vec::with_capacity(events.len());
+        for event in events {
+            let mut local_scroll = None;
+            match event {
+                protocol::ClientPaneInputEvent::Mouse { kind, lines, .. }
+                    if matches!(
+                        external_mouse_mode,
+                        crate::terminal::external::ExternalMouseMode::None
+                    ) => {
+                        local_scroll = match kind {
+                            protocol::ClientMouseKind::ScrollUp => {
+                                Some(-i32::from((*lines).max(1)))
+                            }
+                            protocol::ClientMouseKind::ScrollDown => {
+                                Some(i32::from((*lines).max(1)))
+                            }
+                            _ => None,
+                        };
+                    }
+                protocol::ClientPaneInputEvent::Key {
+                    code,
+                    kind,
+                    modifiers,
+                    ..
+                } if matches!(
+                        external_mouse_mode,
+                        crate::terminal::external::ExternalMouseMode::None
+                    )
+                    && !external_alternate_screen
+                    && *modifiers == 0
+                    && matches!(code, protocol::ClientKeyCode::PageUp | protocol::ClientKeyCode::PageDown) =>
+                {
+                    local_scroll = match kind {
+                        protocol::ClientKeyKind::Press | protocol::ClientKeyKind::Repeat => {
+                            Some(if *code == protocol::ClientKeyCode::PageUp {
+                                -external_rows
+                            } else {
+                                external_rows
+                            })
+                        }
+                        protocol::ClientKeyKind::Release => Some(0),
+                    };
+                }
+                _ => {}
+            }
+            if let Some(delta) = local_scroll {
+                if delta == 0 {
+                    continue;
+                }
+                if let Err(error) = session.scroll(delta) {
+                    warn!(client_id, terminal_id = %terminal_id, %error, "external shell scroll failed");
+                } else {
+                    changed = true;
+                }
+                continue;
+            }
+            remote_events.push(event.clone());
+        }
+
+        let owner = self.terminal_attach_owners.get(&terminal_id).copied();
+        if owner.is_some_and(|current| current != client_id) {
+            debug!(
+                client_id,
+                terminal_id = %terminal_id,
+                owner = ?owner,
+                "ignored external shell mutation from observer"
+            );
+            if changed {
+                self.app.render_dirty.request_generic();
+            }
+            return true;
+        }
+
+        let bytes = match encode_external_client_input(session.as_ref(), &remote_events) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external shell input encoding failed");
+                return changed;
+            }
+        };
+        if bytes.is_empty() {
+            if changed {
+                self.app.render_dirty.request_generic();
+            }
+            return changed;
+        }
+        let Some(binding) = self
+            .app
+            .state
+            .terminals
+            .get(&real_terminal_id)
+            .and_then(|terminal| terminal.external_binding.as_ref())
+            .map(|binding| binding.execution.clone())
+        else {
+            return changed;
+        };
+        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+            return changed;
+        };
+        match runtime.submit(crate::runtime_provider::ProviderCommand::TerminalInput {
+            binding,
+            bytes,
+        }) {
+            Ok(_) => {
+                self.terminal_attach_owners
+                    .insert(terminal_id, client_id);
+                session.reset_scroll();
+                self.app.render_dirty.request_generic();
+                true
+            }
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, ?error, "external shell input was not admitted");
+                changed
+            }
+        }
+    }
+
+    /// Forward already-framed bytes from a direct terminal attachment. The
+    /// direct client is assigned ownership during attach, so this route does
+    /// not reinterpret its keyboard protocol or allow an observer to bypass
+    /// the controller map.
+    fn handle_external_direct_input(
+        &mut self,
+        client_id: u64,
+        terminal_id: String,
+        data: Vec<u8>,
+    ) -> bool {
+        if data.is_empty()
+            || self.terminal_attach_owners.get(&terminal_id) != Some(&client_id)
+        {
+            return false;
+        }
+        let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) else {
+            return false;
+        };
+        let Some(session) = self
+            .app
+            .terminal_runtimes
+            .external_session(&real_terminal_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(binding) = self
+            .app
+            .state
+            .terminals
+            .get(&real_terminal_id)
+            .and_then(|terminal| terminal.external_binding.as_ref())
+            .map(|binding| binding.execution.clone())
+        else {
+            return false;
+        };
+        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+            return false;
+        };
+        match runtime.submit(crate::runtime_provider::ProviderCommand::TerminalInput {
+            binding,
+            bytes: data,
+        }) {
+            Ok(_) => {
+                session.reset_scroll();
+                true
+            }
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, ?error, "external direct input was not admitted");
+                false
+            }
+        }
+    }
+
+    fn handle_external_direct_resize(
+        &mut self,
+        client_id: u64,
+        terminal_id: String,
+        rows: u16,
+        cols: u16,
+        cell_size: crate::kitty_graphics::HostCellSize,
+    ) -> bool {
+        if self.terminal_attach_owners.get(&terminal_id) != Some(&client_id) {
+            return false;
+        }
+        let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) else {
+            return false;
+        };
+        if self
+            .app
+            .terminal_runtimes
+            .external_session(&real_terminal_id)
+            .is_none()
+        {
+            return false;
+        }
+        let Some(binding) = self
+            .app
+            .state
+            .terminals
+            .get(&real_terminal_id)
+            .and_then(|terminal| terminal.external_binding.as_ref())
+            .map(|binding| binding.execution.clone())
+        else {
+            return false;
+        };
+        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+            return false;
+        };
+        match runtime.submit_external_resize(
+            binding,
+            rows,
+            cols,
+            u16::try_from(cell_size.width_px).unwrap_or(u16::MAX),
+            u16::try_from(cell_size.height_px).unwrap_or(u16::MAX),
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, ?error, "external direct resize was not admitted");
+                false
+            }
+        }
+    }
+
+    fn handle_external_direct_mouse(
+        &mut self,
+        client_id: u64,
+        terminal_id: String,
+        kind: protocol::ClientMouseKind,
+        position: protocol::ClientMousePosition,
+        modifiers: u8,
+        lines: u16,
+    ) -> bool {
+        let Some(session) = self.external_session_for_terminal_id_string(&terminal_id) else {
+            return false;
+        };
+        let modes = match session.render_snapshot() {
+            Ok(snapshot) => snapshot.modes,
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external direct mouse snapshot failed");
+                return false;
+            }
+        };
+        if matches!(
+            kind,
+            protocol::ClientMouseKind::ScrollUp | protocol::ClientMouseKind::ScrollDown
+        ) && matches!(
+            modes.mouse,
+            crate::terminal::external::ExternalMouseMode::None
+        ) {
+            let delta = match kind {
+                protocol::ClientMouseKind::ScrollUp => -i32::from(lines.max(1)),
+                protocol::ClientMouseKind::ScrollDown => i32::from(lines.max(1)),
+                _ => unreachable!("scroll kind checked above"),
+            };
+            if let Err(error) = session.scroll(delta) {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external direct scroll failed");
+                return false;
+            }
+            self.app.render_dirty.request_generic();
+            return true;
+        }
+        let event = protocol::ClientPaneInputEvent::Mouse {
+            kind,
+            position,
+            geometry: None,
+            modifiers,
+            lines: lines.max(1),
+        };
+        let bytes = match encode_external_client_input(session.as_ref(), &[event]) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external direct mouse encoding failed");
+                return false;
+            }
+        };
+        if bytes.is_empty() {
+            // Unsupported motion (or a child with mouse reporting disabled) is
+            // still a well-formed attach event, but it has no remote effect.
+            return true;
+        }
+        self.handle_external_direct_input(client_id, terminal_id, bytes)
     }
 
     fn resolve_terminal_target_id_string(&self, target: &str) -> Option<String> {
@@ -1488,8 +1818,14 @@ impl HeadlessServer {
             .external_session_for_terminal_id_string(&terminal_id)
             .is_some()
         {
-            debug!(client_id, terminal_id = %terminal_id, "ignored mouse input for read-only external terminal");
-            return false;
+            return self.handle_external_direct_mouse(
+                client_id,
+                terminal_id,
+                kind,
+                position,
+                modifiers,
+                lines,
+            );
         }
         let terminal_size = client.terminal_size;
         let cell_size = client.cell_size;
@@ -1917,10 +2253,25 @@ impl HeadlessServer {
             .state
             .direct_attach_resize_locks
             .insert(real_terminal_id.clone());
-        self.app
-            .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
-        if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
-            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+        if self
+            .app
+            .terminal_runtimes
+            .external_session(&real_terminal_id)
+            .is_some()
+        {
+            let _ = self.handle_external_direct_resize(
+                client_id,
+                terminal_id,
+                rows,
+                cols,
+                cell_size,
+            );
+        } else {
+            self.app
+                .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+            if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
+                runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+            }
         }
         true
     }
@@ -2142,17 +2493,14 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                let terminal_id = terminal_id.clone();
                 if self
-                    .external_session_for_terminal_id_string(terminal_id)
+                    .external_session_for_terminal_id_string(&terminal_id)
                     .is_some()
                 {
-                    debug!(
-                        client_id,
-                        terminal_id, "ignored input for read-only external terminal"
-                    );
-                    return false;
+                    return self.handle_external_direct_input(client_id, terminal_id, data);
                 }
-                if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                     if let Err(err) = apply_terminal_attach_input(runtime, data) {
                         warn!(client_id, terminal_id = %terminal_id, err = %err);
                     }
@@ -2257,6 +2605,19 @@ impl HeadlessServer {
                     None
                 };
                 if let Some((terminal_id, cell_size)) = direct_terminal_id {
+                    if self
+                        .external_session_for_terminal_id_string(&terminal_id)
+                        .is_some()
+                    {
+                        let _ = self.handle_external_direct_resize(
+                            client_id,
+                            terminal_id,
+                            rows,
+                            cols,
+                            cell_size,
+                        );
+                        return true;
+                    }
                     if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
                         runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
                     }
@@ -2433,6 +2794,46 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                let Some(terminal_id) = self
+                    .app
+                    .state
+                    .workspaces
+                    .get(workspace_index)
+                    .and_then(|workspace| workspace.terminal_id(runtime_pane_id))
+                    .cloned()
+                else {
+                    return false;
+                };
+                if self
+                    .app
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .is_some_and(|terminal| terminal.external_binding.is_some())
+                {
+                    let popup_blocks_input = self.app.state.popup_pane.is_some()
+                        && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
+                    if popup_blocks_input
+                        || !self.shell_client_views_pane(
+                            client_id,
+                            workspace_index,
+                            runtime_pane_id,
+                        )
+                    {
+                        return false;
+                    }
+                    let interaction = client_pane_input_has_interaction(&events);
+                    let foreground_changed =
+                        interaction && self.promote_client_to_foreground(client_id);
+                    let geometry_changed =
+                        interaction && self.claim_shell_tab_geometry(client_id, false);
+                    let routed = self.handle_external_shell_pane_input(
+                        client_id,
+                        terminal_id.to_string(),
+                        &events,
+                    );
+                    return foreground_changed | geometry_changed | routed;
+                }
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
