@@ -69,6 +69,7 @@ struct SharedState {
     detached: AtomicBool,
     stopped: AtomicBool,
     last_external_resize: Mutex<Option<(u16, u16, u16, u16)>>,
+    resize_admission: Mutex<()>,
 }
 
 /// Factory for the provider actor.  The actor owns the only mutable
@@ -148,6 +149,7 @@ impl ProviderRuntime {
             detached: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             last_external_resize: Mutex::new(None),
+            resize_admission: Mutex::new(()),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -248,8 +250,18 @@ impl ProviderRuntimeHandle {
         pixel_height: u16,
     ) -> Result<bool, SubmitError> {
         let geometry = (rows, cols, pixel_width, pixel_height);
+        // Serialize the cache reservation with other resize callers. Reserve
+        // before queue admission so a fast worker failure (or an inline queue
+        // rejection) cannot complete before the deduplication state exists.
+        // The reservation is released on admission failure; worker failures
+        // clear it from the normal terminal-control failure publication path.
+        let _admission = self
+            .shared
+            .resize_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
-            let cached = self
+            let mut cached = self
                 .shared
                 .last_external_resize
                 .lock()
@@ -257,20 +269,26 @@ impl ProviderRuntimeHandle {
             if *cached == Some(geometry) {
                 return Ok(false);
             }
+            *cached = Some(geometry);
         }
-        self.submit(ProviderCommand::TerminalResize {
+        let result = self.submit(ProviderCommand::TerminalResize {
             binding,
             rows,
             cols,
             pixel_width,
             pixel_height,
-        })?;
-        let mut cached = self
-            .shared
-            .last_external_resize
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *cached = Some(geometry);
+        });
+        if let Err(error) = result {
+            let mut cached = self
+                .shared
+                .last_external_resize
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *cached == Some(geometry) {
+                *cached = None;
+            }
+            return Err(error);
+        }
         Ok(true)
     }
 
