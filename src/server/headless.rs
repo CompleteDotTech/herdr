@@ -1461,6 +1461,7 @@ impl HeadlessServer {
         terminal_id: String,
         kind: protocol::ClientMouseKind,
         position: protocol::ClientMousePosition,
+        geometry: Option<protocol::ClientMouseGeometry>,
         modifiers: u8,
         lines: u16,
     ) -> bool {
@@ -1496,7 +1497,7 @@ impl HeadlessServer {
         let event = protocol::ClientPaneInputEvent::Mouse {
             kind,
             position,
-            geometry: None,
+            geometry,
             modifiers,
             lines: lines.max(1),
         };
@@ -1823,6 +1824,7 @@ impl HeadlessServer {
                 terminal_id,
                 kind,
                 position,
+                geometry,
                 modifiers,
                 lines,
             );
