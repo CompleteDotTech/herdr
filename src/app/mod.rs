@@ -20,6 +20,7 @@ mod ids;
 pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
+mod runtime_providers;
 mod session;
 pub mod state;
 mod tab_bar_status;
@@ -74,6 +75,7 @@ pub(crate) struct AppPolicy {
     pub(crate) persist_session: bool,
     pub(crate) persist_plugin_registry: bool,
     pub(crate) background_updates: bool,
+    pub(crate) load_runtime_providers: bool,
 }
 
 impl AppPolicy {
@@ -82,6 +84,7 @@ impl AppPolicy {
         persist_session: true,
         persist_plugin_registry: true,
         background_updates: true,
+        load_runtime_providers: true,
     };
 
     #[cfg(test)]
@@ -90,6 +93,7 @@ impl AppPolicy {
         persist_session: false,
         persist_plugin_registry: false,
         background_updates: false,
+        load_runtime_providers: false,
     };
 
     #[cfg(unix)]
@@ -98,6 +102,7 @@ impl AppPolicy {
         persist_session: true,
         persist_plugin_registry: true,
         background_updates: true,
+        load_runtime_providers: true,
     };
 }
 
@@ -108,6 +113,7 @@ pub struct App {
     pub(crate) direct_graphics_available: bool,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    pub(crate) runtime_providers: runtime_providers::RuntimeProviders,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -574,6 +580,9 @@ impl App {
             direct_graphics_available: false,
             pixel_mouse_available: false,
             terminal_runtimes: restored_terminal_runtimes,
+            runtime_providers: runtime_providers::RuntimeProviders::load(
+                policy.load_runtime_providers,
+            ),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -623,6 +632,7 @@ impl App {
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
+        app.restore_runtime_providers();
         app
     }
 
@@ -678,6 +688,7 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        app.restore_runtime_providers();
         Ok(app)
     }
 

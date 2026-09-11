@@ -407,7 +407,7 @@ impl App {
             None => match base64::engine::general_purpose::STANDARD.decode(params.data_base64) {
                 Ok(data) => data,
                 Err(_) => {
-                    return encode_error(id, "invalid_image", "data_base64 is not valid base64")
+                    return encode_error(id, "invalid_image", "data_base64 is not valid base64");
                 }
             },
         };

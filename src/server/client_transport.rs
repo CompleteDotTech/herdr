@@ -386,6 +386,7 @@ pub(crate) enum ServerEvent {
     /// A client-owned shell completed its dedicated handshake.
     ClientShellConnected {
         client_id: u64,
+        surface_codec: protocol::surface::SurfaceCodec,
         surface_cols: u16,
         surface_rows: u16,
         cell_width_px: u32,
@@ -681,6 +682,7 @@ pub(crate) fn handle_client_handshake(
         }
     };
 
+    let mut surface_codec = protocol::surface::SurfaceCodec::V1;
     let (
         client_cols,
         client_rows,
@@ -748,6 +750,7 @@ pub(crate) fn handle_client_handshake(
                 write_endpoint_rejection(&mut stream, code, reason);
                 return Ok(());
             }
+            surface_codec = hello.preferred_surface_codec();
             (
                 hello.surface_size.cols,
                 hello.surface_size.rows,
@@ -806,7 +809,8 @@ pub(crate) fn handle_client_handshake(
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
-        );
+        )
+        .with_surface_codec(surface_codec);
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
             data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
@@ -858,6 +862,7 @@ pub(crate) fn handle_client_handshake(
     {
         ServerEvent::ClientShellConnected {
             client_id,
+            surface_codec,
             surface_cols: client_cols,
             surface_rows: client_rows,
             cell_width_px,
@@ -1820,6 +1825,7 @@ mod tests {
         {
             ServerEvent::ClientShellConnected {
                 client_id,
+                surface_codec,
                 surface_cols,
                 surface_rows,
                 cell_width_px,
@@ -1832,6 +1838,7 @@ mod tests {
                 writer,
             } => {
                 assert_eq!(client_id, 43);
+                assert_eq!(surface_codec, protocol::surface::SurfaceCodec::V1);
                 assert_eq!((surface_cols, surface_rows), (80, 29));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert!(pixel_mouse);
@@ -1850,6 +1857,80 @@ mod tests {
             .join()
             .expect("handshake thread join")
             .expect("handshake thread result");
+    }
+
+    #[test]
+    fn client_shell_surface_v2_negotiates_and_preserves_widths_over_socket() {
+        use crate::protocol::surface::SurfaceCodec;
+        let (mut client_stream, server_stream, _path) = local_stream_pair("surface-v2");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(8);
+        let quit = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 76, &server_event_tx, &quit)
+        });
+        // Exercise the real new client's advertised list and welcome validation.
+        let negotiation = crate::client::probe_endpoint_negotiation(&mut client_stream)
+            .expect("negotiate current client");
+        assert_eq!(negotiation.surface_codec, SurfaceCodec::V2);
+        let ServerEvent::ClientShellConnected {
+            surface_codec,
+            writer,
+            ..
+        } = recv_server_event(&mut server_event_rx, "surface connection")
+        else {
+            panic!("expected shell connection")
+        };
+        assert_eq!(surface_codec, SurfaceCodec::V2);
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_symbol("❤\u{fe0f}");
+        buffer[(1, 0)].set_symbol("B");
+        let mut frame =
+            protocol::FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        frame.cells[0].width = 1;
+        frame.cells[1].width = 1;
+        let full = ServerMessage::PaneSurface(protocol::PaneSurfaceFrame {
+            boot_id: "socket-test".into(),
+            projection_revision: 3,
+            surface_revision: 1,
+            frame: frame.clone(),
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: None,
+            graphics: protocol::SurfaceGraphicsScene::default(),
+        });
+        let patch = ServerMessage::PaneSurfacePatch(protocol::PaneSurfacePatch {
+            boot_id: "socket-test".into(),
+            projection_revision: 3,
+            base_surface_revision: 1,
+            surface_revision: 2,
+            rows: vec![protocol::PaneSurfacePatchRow {
+                x: 0,
+                y: 0,
+                cells: frame.cells,
+            }],
+            panes: Vec::new(),
+            cursor: None,
+        });
+        for expected in [full, patch] {
+            writer
+                .render
+                .try_send(surface_codec.frame(&expected, MAX_FRAME_SIZE).unwrap())
+                .unwrap();
+            let encoded = protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).unwrap();
+            assert!(
+                matches!(&encoded, ServerMessage::EndpointControl { kind, .. }
+                if kind == crate::protocol::surface::SURFACE_CODEC_V2)
+            );
+            let decoded = negotiation
+                .surface_codec
+                .decode(encoded, MAX_FRAME_SIZE)
+                .unwrap();
+            assert_eq!(decoded, expected);
+        }
+        drop(writer);
+        drop(client_stream);
+        drop(server_event_rx);
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

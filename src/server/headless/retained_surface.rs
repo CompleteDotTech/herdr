@@ -241,6 +241,20 @@ impl HeadlessServer {
         {
             fallback!("unsafe_state");
         }
+        if pty_sources.iter().any(|pane_id| {
+            self.terminal_id_for_pane(*pane_id)
+                .is_some_and(|terminal_id| {
+                    self.app
+                        .terminal_runtimes
+                        .external_session(terminal_id)
+                        .is_some()
+                })
+        }) {
+            // External snapshots do not expose a damage protocol yet. Force
+            // the complete renderer so a retained native patch can never
+            // publish a partial or stale external model surface.
+            fallback!("external_complete_renderer");
+        }
         let mut targets = render_targets(&self.clients, self.foreground_client_id);
         targets.retain(|(client_id, _, _, _, mode)| {
             !matches!(mode, ClientConnectionMode::ClientShell)
@@ -504,20 +518,22 @@ impl HeadlessServer {
             } else {
                 protocol::MAX_FRAME_SIZE
             };
-            let serialized =
-                match Self::frame_server_message_with_max(prepared.message(), max_frame_size) {
-                    Ok(serialized) => serialized,
-                    Err(error) => {
-                        warn!(
-                            client_id,
-                            %error,
-                            "failed to serialize retained pane surface patch"
-                        );
-                        client.defer_full_render();
-                        deferred += 1;
-                        continue;
-                    }
-                };
+            let serialized = match client
+                .surface_codec
+                .frame(prepared.message(), max_frame_size)
+            {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(
+                        client_id,
+                        %error,
+                        "failed to serialize retained pane surface patch"
+                    );
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
             match writer.render.try_send(serialized) {
                 Ok(()) => {
@@ -568,6 +584,7 @@ mod tests {
             modifier: 0,
             skip: false,
             hyperlink: None,
+            width: 0,
         }
     }
 

@@ -3096,6 +3096,7 @@ fn cell_data_from_style(symbol: String, style: Style) -> CellData {
         modifier: crate::protocol::modifier_to_u16(style.add_modifier),
         skip: false,
         hyperlink: None,
+        width: 0,
     }
 }
 
@@ -5213,10 +5214,12 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(20, 1);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
+        let rendered = terminal
             .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 1), false))
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        // Inspect the completed frame: ratatui may omit the covered tail from
+        // the backend diff, leaving TestBackend's previous blank in that slot.
+        let buffer = rendered.buffer;
 
         assert_eq!(buffer[(0, 0)].symbol(), "ｶ\u{ff9e}");
         assert_eq!(
@@ -5225,6 +5228,17 @@ mod tests {
             "wide spacer tail must stay empty so the host terminal does not overwrite the voiced kana"
         );
         assert_eq!(buffer[(2, 0)].symbol(), "Z");
+        let previous = ratatui::buffer::Buffer::empty(buffer.area);
+        let updates = previous.diff(buffer);
+        assert!(updates
+            .iter()
+            .any(|(x, y, cell)| { (*x, *y) == (0, 0) && cell.symbol() == "ｶ\u{ff9e}" }));
+        assert!(
+            updates
+                .iter()
+                .all(|(x, y, cell)| (*x, *y) != (1, 0) || cell.symbol().is_empty()),
+            "backend diff must never overwrite the voiced kana's tail: {updates:?}"
+        );
     }
 
     #[test]

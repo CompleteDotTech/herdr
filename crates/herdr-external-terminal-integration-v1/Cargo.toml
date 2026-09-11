@@ -1,0 +1,14 @@
+[package]
+name = "herdr-external-terminal-integration-v1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Private Herdr integration draft for a checkpointed external terminal model"
+
+[dependencies]
+coven-terminal = { path = "../coven-terminal" }
+coven-terminal-checkpoint-transport = { path = "../coven-terminal-checkpoint-transport", default-features = true, features = ["alacritty-engine"] }
+herdr-external-terminal-renderer-v1 = { path = "../herdr-external-terminal-renderer-v1" }
+alacritty_terminal = { package = "alacritty_terminal", path = "../../vendor/alacritty-terminal-checkpoint", version = "0.26.0" }
+vte = { path = "../../vendor/vte-checkpoint", version = "0.15.0", default-features = false, features = ["std", "ansi", "checkpoint"] }
+ratatui = "0.30"

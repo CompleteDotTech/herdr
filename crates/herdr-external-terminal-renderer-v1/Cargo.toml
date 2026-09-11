@@ -1,0 +1,11 @@
+[package]
+name = "herdr-external-terminal-renderer-v1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Standalone ratatui bridge for a checkpointed external terminal cell view"
+
+[dependencies]
+ratatui = "=0.30.0"
+

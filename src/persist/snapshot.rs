@@ -10,6 +10,7 @@ use crate::workspace::Workspace;
 
 /// Current snapshot format version.
 pub(super) const SNAPSHOT_VERSION: u32 = 3;
+const EXTERNAL_SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -96,6 +97,10 @@ pub struct TabSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_binding: Option<crate::terminal::backend::ExternalBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_checkpoint: Option<crate::terminal::backend::ExternalCheckpointState>,
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -260,7 +265,14 @@ pub fn capture(
     selected: usize,
 ) -> SessionSnapshot {
     SessionSnapshot {
-        version: SNAPSHOT_VERSION,
+        version: if terminals
+            .values()
+            .any(|terminal| terminal.external_binding.is_some())
+        {
+            EXTERNAL_SNAPSHOT_VERSION
+        } else {
+            SNAPSHOT_VERSION
+        },
         workspaces: workspaces
             .iter()
             .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
@@ -316,13 +328,21 @@ fn capture_tab(
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
         let cwd = tab
-            .cwd_for_pane(*id, terminals, terminal_runtimes)
+            .terminal_id(*id)
+            .and_then(|id| terminals.get(id))
+            .filter(|terminal| terminal.external_binding.is_some())
+            .map(|terminal| terminal.cwd.clone())
+            .or_else(|| tab.cwd_for_pane(*id, terminals, terminal_runtimes))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let terminal = tab
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
+        let external_binding = terminal.and_then(|terminal| terminal.external_binding.clone());
+        let external_checkpoint =
+            terminal.and_then(|terminal| terminal.external_checkpoint.clone());
+        let terminal = terminal.filter(|terminal| terminal.external_binding.is_none());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
@@ -359,6 +379,8 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
+                external_binding,
+                external_checkpoint,
                 cwd,
                 label,
                 agent_name,
@@ -444,15 +466,93 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
     }
 }
 
+impl SessionSnapshot {
+    pub(crate) fn has_external_bindings(&self) -> bool {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.external_binding.is_some())
+    }
+
+    pub(crate) fn validate_external_bindings(&self) -> Result<(), String> {
+        if self.version == EXTERNAL_SNAPSHOT_VERSION {
+            let mut all_layout_ids = std::collections::HashSet::new();
+            for tab in self.workspaces.iter().flat_map(|workspace| &workspace.tabs) {
+                let mut pending = vec![&tab.layout];
+                let mut layout_ids = std::collections::HashSet::new();
+                while let Some(node) = pending.pop() {
+                    match node {
+                        LayoutSnapshot::Pane(id) => {
+                            if !layout_ids.insert(*id) || !all_layout_ids.insert(*id) {
+                                return Err(
+                                    "duplicate pane identity in external snapshot layout".into()
+                                );
+                            }
+                        }
+                        LayoutSnapshot::Split { first, second, .. } => {
+                            pending.push(first);
+                            pending.push(second);
+                        }
+                    }
+                }
+                if layout_ids.len() != tab.panes.len()
+                    || !layout_ids.iter().all(|id| tab.panes.contains_key(id))
+                {
+                    return Err("external snapshot layout and pane map disagree".into());
+                }
+            }
+        }
+        let mut terminal_ids = std::collections::HashSet::new();
+        let mut execution_ids = std::collections::HashSet::new();
+        for pane in self
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .flat_map(|tab| tab.panes.values())
+        {
+            let Some(binding) = &pane.external_binding else {
+                continue;
+            };
+            if self.version != EXTERNAL_SNAPSHOT_VERSION {
+                return Err("external bindings require snapshot version 4".into());
+            }
+            if pane.agent_session.is_some()
+                || pane.launch_argv.is_some()
+                || pane.managed_agent_kind.is_some()
+                || pane.agent_name.is_some()
+            {
+                return Err("external binding conflicts with native launch metadata".into());
+            }
+            if !terminal_ids.insert(&binding.terminal_id) {
+                return Err("duplicate external terminal identity".into());
+            }
+            let execution = &binding.execution;
+            if !execution_ids.insert((
+                execution.provider_id.as_str(),
+                execution.host_id.as_str(),
+                execution.scope.project_id.as_str(),
+                execution.scope.profile_id.as_str(),
+                execution.session_id.as_str(),
+            )) {
+                return Err("duplicate external execution identity".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > SNAPSHOT_VERSION {
+    if raw.version > EXTERNAL_SNAPSHOT_VERSION {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, SNAPSHOT_VERSION
+            raw.version, EXTERNAL_SNAPSHOT_VERSION
         ));
     }
-    migrate_snapshot(raw)
+    let snapshot = migrate_snapshot(raw)?;
+    snapshot.validate_external_bindings()?;
+    Ok(snapshot)
 }
 
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
@@ -636,6 +736,8 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                external_binding: None,
+                external_checkpoint: None,
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -647,6 +749,8 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                external_binding: None,
+                external_checkpoint: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -710,6 +814,92 @@ mod tests {
         );
         assert_eq!(restored.sidebar_width, Some(26));
         assert_eq!(restored.sidebar_section_split, Some(0.5));
+    }
+
+    fn external_snapshot_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "version": 4, "active": 0, "selected": 0,
+            "workspaces": [{ "identity_cwd": "/remote/project", "tabs": [{
+                "layout": {"Pane": 1}, "zoomed": false,
+                "panes": {"1": {"cwd": "/remote/project", "external_binding": {
+                    "kind": "coven", "terminal_id": "coven_external",
+                    "provider_id": "fixture", "host_id": "host",
+                    "scope": {"projectId": "project", "profileId": "profile", "policyGeneration": 1},
+                    "authority": {"id": "authority", "generation": 1},
+                    "session_id": "session", "generation": 1, "pinned_source": null
+                }}}
+            }]}]
+        })
+    }
+
+    #[test]
+    fn external_snapshot_retains_identity_and_omits_runtime_generation() {
+        let snapshot = parse_snapshot(&external_snapshot_fixture().to_string()).unwrap();
+        assert!(snapshot.has_external_bindings());
+        let binding = snapshot.workspaces[0].tabs[0].panes[&1]
+            .external_binding
+            .as_ref()
+            .unwrap();
+        assert_eq!(binding.terminal_id.as_str(), "coven_external");
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("runtime_generation"));
+        assert!(!encoded.contains("launch_argv"));
+        assert!(parse_snapshot(&encoded).unwrap().has_external_bindings());
+    }
+
+    #[test]
+    fn external_snapshot_refuses_native_metadata_unknown_backend_and_old_version() {
+        for field in [
+            "launch_argv",
+            "agent_name",
+            "managed_agent_kind",
+            "agent_session",
+        ] {
+            let mut fixture = external_snapshot_fixture();
+            fixture["workspaces"][0]["tabs"][0]["panes"]["1"][field] = match field {
+                "launch_argv" => serde_json::json!(["sh"]),
+                "agent_session" => {
+                    serde_json::json!({"source":"native","agent":"codex","kind":"id","value":"session"})
+                }
+                _ => serde_json::json!("codex"),
+            };
+            assert!(parse_snapshot(&fixture.to_string()).is_err(), "{field}");
+        }
+        let mut fixture = external_snapshot_fixture();
+        fixture["version"] = 3.into();
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+        fixture["version"] = 4.into();
+        fixture["workspaces"][0]["tabs"][0]["panes"]["1"]["external_binding"]["kind"] =
+            "unknown".into();
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+    }
+
+    #[test]
+    fn duplicate_external_views_and_execution_identities_are_refused() {
+        let mut fixture = external_snapshot_fixture();
+        let pane = fixture["workspaces"][0]["tabs"][0]["panes"]["1"].clone();
+        fixture["workspaces"][0]["tabs"][0]["panes"]["2"] = pane;
+        fixture["workspaces"][0]["tabs"][0]["layout"] = serde_json::json!({"Split":{"direction":"Horizontal","ratio":0.5,"first":{"Pane":1},"second":{"Pane":2}}});
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+        fixture["workspaces"][0]["tabs"][0]["panes"]["2"]["external_binding"]["terminal_id"] =
+            "coven_other".into();
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+        fixture["workspaces"][0]["tabs"][0]["panes"]["2"]["external_binding"]["session_id"] =
+            "different".into();
+        assert!(parse_snapshot(&fixture.to_string()).is_ok());
+    }
+
+    #[test]
+    fn external_snapshot_refuses_missing_or_repeated_layout_leaves() {
+        let mut fixture = external_snapshot_fixture();
+        fixture["workspaces"][0]["tabs"][0]["layout"] = serde_json::json!({"Pane":2});
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+        fixture["workspaces"][0]["tabs"][0]["layout"] = serde_json::json!({"Split":{"direction":"Horizontal","ratio":0.5,"first":{"Pane":1},"second":{"Pane":1}}});
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
+        let mut fixture = external_snapshot_fixture();
+        fixture["workspaces"][0]["tabs"][0]["panes"]["1"]["external_binding"]["terminal_id"] =
+            "term_native_namespace".into();
+        assert!(parse_snapshot(&fixture.to_string()).is_err());
     }
 
     #[test]
@@ -1200,6 +1390,8 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                external_binding: None,
+                external_checkpoint: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -1211,6 +1403,8 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                external_binding: None,
+                external_checkpoint: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

@@ -287,7 +287,8 @@ fn connect_once(
     let negotiation = EndpointNegotiation::new(
         handshake.endpoint_methods.unwrap_or_default(),
         handshake.endpoint_capabilities.unwrap_or_default(),
-    );
+    )
+    .with_surface_codec(handshake.surface_codec);
     if !negotiation.supports_surface_interest()
         || (!endpoint_id.is_local() && !negotiation.supports_health_check())
     {

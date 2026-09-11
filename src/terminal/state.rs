@@ -119,6 +119,13 @@ struct RecentAgentProcessExit {
 /// metadata.
 pub struct TerminalState {
     pub id: TerminalId,
+    pub(crate) external_binding: Option<super::backend::ExternalBinding>,
+    pub(crate) external_checkpoint: Option<super::backend::ExternalCheckpointState>,
+    pub(crate) external_observation: Option<crate::runtime_provider::ProviderObservation>,
+    pub(crate) external_observed_at: Option<Instant>,
+    pub(crate) external_observed_contract: Option<&'static str>,
+    pub(crate) external_transcript:
+        Option<crate::runtime_provider::transcript::TranscriptProjection>,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
@@ -154,6 +161,12 @@ impl TerminalState {
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
         Self {
             id,
+            external_binding: None,
+            external_checkpoint: None,
+            external_observation: None,
+            external_observed_at: None,
+            external_observed_contract: None,
+            external_transcript: None,
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,

@@ -271,27 +271,36 @@ pub(super) fn render_pane_surface(
                     .pane_ids()
                     .into_iter()
                     .filter_map(|pane_id| {
-                        app.state
-                            .runtime_for_pane_in_workspace(
-                                &app.terminal_runtimes,
-                                target.workspace_index,
-                                pane_id,
-                            )
-                            .map(|runtime| (pane_id, runtime.content_seq()))
+                        if let Some(runtime) = app.state.runtime_for_pane_in_workspace(
+                            &app.terminal_runtimes,
+                            target.workspace_index,
+                            pane_id,
+                        ) {
+                            return Some((pane_id, runtime.content_seq()));
+                        }
+                        let terminal_id = tab.terminal_id(pane_id)?;
+                        app.terminal_runtimes
+                            .external_session(terminal_id)
+                            .map(|session| (pane_id, session.content_revision()))
                     })
                     .collect::<std::collections::HashMap<_, _>>(),
             )
         })
         .unwrap_or_default();
-    let (buffer, cursor, hyperlinks, layout) =
-        crate::server::render_stream::render_tab_surface_virtual(
-            &app.state,
-            &app.terminal_runtimes,
-            target,
-            area,
-            resize_panes,
-            cell_size,
-        );
+    let crate::server::render_stream::RenderedTabSurface {
+        buffer,
+        cursor,
+        hyperlinks,
+        layout,
+        external_snapshots,
+    } = crate::server::render_stream::render_tab_surface_virtual(
+        &app.state,
+        &app.terminal_runtimes,
+        target,
+        area,
+        resize_panes,
+        cell_size,
+    );
     let panes = target
         .map(|target| {
             let workspace_index = target.workspace_index;
@@ -305,10 +314,20 @@ pub(super) fn render_pane_surface(
                             workspace_index,
                             pane.id,
                         );
-                        let mouse_reporting =
-                            runtime.is_some_and(|runtime| runtime.mouse_reporting_enabled());
-                        let sgr_pixel_mouse =
-                            runtime.is_some_and(|runtime| runtime.sgr_pixel_mouse_enabled());
+                        let external = external_snapshots.get(&pane.id);
+                        let mouse_reporting = runtime
+                            .is_some_and(|runtime| runtime.mouse_reporting_enabled())
+                            || external.as_ref().is_some_and(|snapshot| {
+                                !matches!(
+                                    snapshot.modes.mouse,
+                                    crate::terminal::external::ExternalMouseMode::None
+                                )
+                            });
+                        let sgr_pixel_mouse = runtime
+                            .is_some_and(|runtime| runtime.sgr_pixel_mouse_enabled())
+                            || external
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.modes.sgr_pixel_mouse);
                         let (pixel_width, pixel_height) = if cell_size.is_known() {
                             (
                                 u32::from(pane.inner_rect.width) * cell_size.width_px,
@@ -317,34 +336,70 @@ pub(super) fn render_pane_surface(
                         } else {
                             (0, 0)
                         };
-                        let content_revision = runtime.map_or(0, |runtime| {
-                            let after = runtime.content_seq();
-                            if content_revisions_before.get(&pane.id).copied() == Some(after)
-                                && after.is_multiple_of(2)
-                            {
-                                after
-                            } else {
-                                after | 1
-                            }
-                        });
+                        let content_revision = runtime.map_or_else(
+                            || {
+                                external.as_ref().map_or_else(
+                                    || {
+                                        app.state
+                                            .workspaces
+                                            .get(workspace_index)
+                                            .and_then(|workspace| workspace.terminal_id(pane.id))
+                                            .and_then(|terminal_id| {
+                                                app.state.terminals.get(terminal_id)
+                                            })
+                                            .and_then(|terminal| {
+                                                terminal.external_transcript.as_ref()
+                                            })
+                                            .map_or(0, |projection| projection.content_revision())
+                                    },
+                                    |snapshot| snapshot.content_revision,
+                                )
+                            },
+                            |runtime| {
+                                let after = runtime.content_seq();
+                                if content_revisions_before.get(&pane.id).copied() == Some(after)
+                                    && after.is_multiple_of(2)
+                                {
+                                    after
+                                } else {
+                                    after | 1
+                                }
+                            },
+                        );
                         protocol::PaneSurfacePane {
                             pane_id,
                             content_revision,
                             rect: pane.rect.into(),
                             inner_rect: pane.inner_rect.into(),
                             scrollbar_rect: pane.scrollbar_rect.map(Into::into),
-                            scroll: runtime.and_then(|runtime| runtime.scroll_metrics()).map(
-                                |metrics| protocol::PaneSurfaceScrollMetrics {
+                            scroll: runtime
+                                .and_then(|runtime| runtime.scroll_metrics())
+                                .map(|metrics| protocol::PaneSurfaceScrollMetrics {
                                     offset_from_bottom: metrics.offset_from_bottom as u64,
                                     max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                                     viewport_rows: metrics.viewport_rows as u64,
-                                },
-                            ),
+                                })
+                                .or_else(|| {
+                                    external.as_ref().map(|snapshot| {
+                                        protocol::PaneSurfaceScrollMetrics {
+                                            offset_from_bottom: snapshot.scroll.offset_from_bottom
+                                                as u64,
+                                            max_offset_from_bottom: snapshot
+                                                .scroll
+                                                .max_offset_from_bottom
+                                                as u64,
+                                            viewport_rows: snapshot.scroll.viewport_rows as u64,
+                                        }
+                                    })
+                                }),
                             focused: pane.is_focused,
                             mouse_reporting,
                             sgr_pixel_mouse,
                             alternate_screen_active: runtime
-                                .is_some_and(|runtime| runtime.alternate_screen_active()),
+                                .is_some_and(|runtime| runtime.alternate_screen_active())
+                                || external
+                                    .as_ref()
+                                    .is_some_and(|snapshot| snapshot.modes.alternate_screen),
                             pixel_width,
                             pixel_height,
                         }

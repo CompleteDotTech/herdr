@@ -35,6 +35,12 @@ pub(super) fn launch_cwd_for_terminal(
     >,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> Option<PathBuf> {
+    if terminals
+        .get(terminal_id)
+        .is_some_and(|terminal| terminal.external_binding.is_some())
+    {
+        return None;
+    }
     terminal_runtimes
         .get(terminal_id)
         .and_then(|runtime| runtime.follow_cwd())
@@ -317,6 +323,16 @@ impl App {
             .state
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
             .and_then(|runtime| runtime.scroll_metrics())
+            .or_else(|| {
+                self.terminal_runtimes
+                    .external_session(&pane.attached_terminal_id)
+                    .and_then(|session| session.render_snapshot().ok())
+                    .map(|snapshot| crate::pane::ScrollMetrics {
+                        offset_from_bottom: snapshot.scroll.offset_from_bottom,
+                        max_offset_from_bottom: snapshot.scroll.max_offset_from_bottom,
+                        viewport_rows: snapshot.scroll.viewport_rows,
+                    })
+            })
             .map(|metrics| crate::api::schema::PaneScrollInfo {
                 offset_from_bottom: metrics.offset_from_bottom as u64,
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,

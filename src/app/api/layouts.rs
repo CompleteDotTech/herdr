@@ -36,7 +36,7 @@ impl App {
             Some(tab_id) => match self.parse_tab_id(tab_id) {
                 Some(target) => Some(target),
                 None => {
-                    return encode_error(id, "tab_not_found", format!("tab {tab_id} not found"))
+                    return encode_error(id, "tab_not_found", format!("tab {tab_id} not found"));
                 }
             },
             None => None,

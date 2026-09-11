@@ -445,6 +445,11 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.metadata_expiry");
             }
 
+            if self.app.poll_runtime_providers(Instant::now()) {
+                needs_render = true;
+                needs_full_render = true;
+            }
+
             // 3. Drain API requests.
             if self.pane_graphics_runtime_active() {
                 let api_impact = self.drain_api_requests_with_render_impact();
@@ -1169,6 +1174,17 @@ impl HeadlessServer {
         self.app.terminal_runtimes.get(&terminal_id)
     }
 
+    fn external_session_for_terminal_id_string(
+        &self,
+        terminal_id: &str,
+    ) -> Option<Arc<crate::terminal::external::ExternalTerminalSession>> {
+        let terminal_id = self.terminal_id_by_string(terminal_id)?;
+        self.app
+            .terminal_runtimes
+            .external_session(&terminal_id)
+            .cloned()
+    }
+
     fn resolve_terminal_target_id_string(&self, target: &str) -> Option<String> {
         if self.terminal_id_by_string(target).is_some() {
             return Some(target.to_owned());
@@ -1241,6 +1257,16 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                if self
+                    .external_session_for_terminal_id_string(terminal_id)
+                    .is_some()
+                {
+                    debug!(
+                        client_id,
+                        terminal_id, "ignored input for read-only external terminal"
+                    );
+                    return false;
+                }
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
                     if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
@@ -1413,7 +1439,21 @@ impl HeadlessServer {
         else {
             return false;
         };
-        let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
+        let terminal_id = terminal_id.clone();
+        if let Some(session) = self.external_session_for_terminal_id_string(&terminal_id) {
+            let delta = match direction {
+                AttachScrollDirection::Up => -(i32::from(lines.max(1))),
+                AttachScrollDirection::Down => i32::from(lines.max(1)),
+            };
+            if let Err(error) = session.scroll(delta) {
+                warn!(client_id, terminal_id = %terminal_id, %error, "external terminal attach scroll failed");
+            } else {
+                self.app.render_dirty.request_generic();
+            }
+            let _ = (source, column, row, modifiers);
+            return true;
+        }
+        let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
             return false;
         };
 
@@ -1444,6 +1484,13 @@ impl HeadlessServer {
             return false;
         };
         let terminal_id = terminal_id.clone();
+        if self
+            .external_session_for_terminal_id_string(&terminal_id)
+            .is_some()
+        {
+            debug!(client_id, terminal_id = %terminal_id, "ignored mouse input for read-only external terminal");
+            return false;
+        }
         let terminal_size = client.terminal_size;
         let cell_size = client.cell_size;
         let pixel_mouse = client.pixel_mouse;
@@ -1937,6 +1984,7 @@ impl HeadlessServer {
             }
             ServerEvent::ClientShellConnected {
                 client_id,
+                surface_codec,
                 surface_cols,
                 surface_rows,
                 cell_width_px,
@@ -1987,6 +2035,7 @@ impl HeadlessServer {
                     Some(writer),
                 );
                 connection.pixel_mouse = pixel_mouse && observed.is_known();
+                connection.surface_codec = surface_codec;
                 connection.direct_graphics = direct_graphics;
                 connection.shell_uses_endpoint_keybindings = endpoint_keybindings;
                 connection.shell_mouse_capture = mouse_capture;
@@ -2093,6 +2142,16 @@ impl HeadlessServer {
                 else {
                     return false;
                 };
+                if self
+                    .external_session_for_terminal_id_string(terminal_id)
+                    .is_some()
+                {
+                    debug!(
+                        client_id,
+                        terminal_id, "ignored input for read-only external terminal"
+                    );
+                    return false;
+                }
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                     if let Err(err) = apply_terminal_attach_input(runtime, data) {
                         warn!(client_id, terminal_id = %terminal_id, err = %err);

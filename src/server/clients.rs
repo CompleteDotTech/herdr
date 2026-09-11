@@ -141,6 +141,8 @@ pub(crate) struct ClientConnection {
     pub(crate) last_activity: u64,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
+    /// The named surface codec selected by this shell connection's handshake.
+    pub(crate) surface_codec: crate::protocol::surface::SurfaceCodec,
     /// Image assets already included in the selected ClientShell scene.
     pub(crate) shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
     /// Passive eligibility for audited local Kitty regular-file graphics.
@@ -226,6 +228,7 @@ impl ClientConnection {
             cell_size,
             last_activity,
             render_state: ClientRenderState::new(render_encoding),
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             shell_graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
             direct_graphics: false,
             pixel_mouse: false,

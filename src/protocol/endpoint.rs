@@ -84,6 +84,18 @@ pub fn snapshot_message(snapshot: &ClientShellSnapshot) -> serde_json::Result<Se
 }
 
 impl EndpointClientHello {
+    pub(crate) fn preferred_surface_codec(&self) -> super::surface::SurfaceCodec {
+        if self
+            .surface_codecs
+            .iter()
+            .any(|codec| codec == super::surface::SURFACE_CODEC_V2)
+        {
+            super::surface::SurfaceCodec::V2
+        } else {
+            super::surface::SurfaceCodec::V1
+        }
+    }
+
     pub fn supports_required_codecs(&self) -> bool {
         self.snapshot_codecs
             .iter()
@@ -101,6 +113,11 @@ impl EndpointClientHello {
 }
 
 impl EndpointServerWelcome {
+    pub(crate) fn with_surface_codec(mut self, codec: super::surface::SurfaceCodec) -> Self {
+        self.surface_codec = codec.name().into();
+        self
+    }
+
     pub fn compatible(methods: Vec<String>) -> Self {
         Self {
             generation: ENDPOINT_PROTOCOL_GENERATION,
@@ -193,6 +210,25 @@ mod tests {
         value["future_feature"] = serde_json::json!({"enabled": true});
         let decoded: EndpointClientHello = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, hello());
+    }
+
+    #[test]
+    fn surface_negotiation_prefers_v2_only_when_offered_and_keeps_v1_floor() {
+        use super::super::surface::{SurfaceCodec, SURFACE_CODEC_V2};
+        let mut client = hello();
+        assert_eq!(client.preferred_surface_codec(), SurfaceCodec::V1);
+        client.surface_codecs.push("shell.surface.future".into());
+        assert_eq!(client.preferred_surface_codec(), SurfaceCodec::V1);
+        client.surface_codecs.push(SURFACE_CODEC_V2.into());
+        assert!(client.supports_required_codecs());
+        assert_eq!(client.preferred_surface_codec(), SurfaceCodec::V2);
+        let welcome = EndpointServerWelcome::compatible(Vec::new())
+            .with_surface_codec(client.preferred_surface_codec());
+        assert_eq!(welcome.surface_codec, SURFACE_CODEC_V2);
+        client
+            .surface_codecs
+            .retain(|codec| codec != SURFACE_CODEC_V1);
+        assert!(!client.supports_required_codecs());
     }
 
     #[test]

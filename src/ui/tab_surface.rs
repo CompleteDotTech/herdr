@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use ratatui::{layout::Rect, Frame};
 
-use super::panes::{compute_pane_infos_for_tab, render_panes, resize_tab_panes};
+use super::panes::{render_panes, resize_tab_panes};
 use crate::app::AppState;
-use crate::layout::{PaneInfo, SplitBorder};
+use crate::layout::{PaneId, PaneInfo, SplitBorder};
 use crate::protocol::CursorState;
 use crate::terminal::TerminalRuntimeRegistry;
 
@@ -23,6 +25,37 @@ pub(crate) struct TabSurfaceView<'a> {
     pub(crate) target: Option<TabSurfaceTarget>,
     pub(crate) pane_infos: &'a [PaneInfo],
     pub(crate) split_borders: &'a [SplitBorder],
+}
+
+/// Capture every external pane in a virtual surface once. The resulting map
+/// is passed to drawing, cursor, hyperlink, and metadata helpers so all parts
+/// of one client frame describe the same model revision.
+pub(crate) fn capture_external_snapshots(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    target: Option<TabSurfaceTarget>,
+) -> HashMap<PaneId, crate::terminal::external::ExternalTerminalSnapshot> {
+    let Some(target) = target else {
+        return HashMap::new();
+    };
+    let Some(tab) = app
+        .workspaces
+        .get(target.workspace_index)
+        .and_then(|workspace| workspace.tabs.get(target.tab_index))
+    else {
+        return HashMap::new();
+    };
+
+    tab.layout
+        .pane_ids()
+        .into_iter()
+        .filter_map(|pane_id| {
+            let terminal_id = tab.terminal_id(pane_id)?;
+            let session = terminal_runtimes.external_session(terminal_id)?;
+            let snapshot = session.render_snapshot().ok()?;
+            Some((pane_id, snapshot))
+        })
+        .collect()
 }
 
 pub(crate) fn compute_tab_surface(
@@ -57,6 +90,28 @@ pub(crate) fn compute_tab_surface_for(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> TabSurfaceLayout {
+    compute_tab_surface_for_with_external_snapshots(
+        app,
+        terminal_runtimes,
+        target,
+        area,
+        resize_panes,
+        cell_size,
+        None,
+    )
+}
+
+pub(crate) fn compute_tab_surface_for_with_external_snapshots(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    target: Option<TabSurfaceTarget>,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    external_snapshots: Option<
+        &HashMap<PaneId, crate::terminal::external::ExternalTerminalSnapshot>,
+    >,
+) -> TabSurfaceLayout {
     let tab = target.and_then(|target| {
         app.workspaces
             .get(target.workspace_index)?
@@ -73,7 +128,7 @@ pub(crate) fn compute_tab_surface_for(
         })
         .unwrap_or_default();
     let pane_infos = target.map_or_else(Vec::new, |target| {
-        compute_pane_infos_for_tab(
+        super::panes::compute_pane_infos_for_tab_with_external_snapshots(
             app,
             terminal_runtimes,
             target.workspace_index,
@@ -81,6 +136,7 @@ pub(crate) fn compute_tab_surface_for(
             area,
             resize_panes,
             cell_size,
+            external_snapshots,
         )
     });
 
@@ -120,6 +176,9 @@ pub(crate) fn render_tab_surface(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: TabSurfaceView<'_>,
+    external_snapshots: Option<
+        &HashMap<PaneId, crate::terminal::external::ExternalTerminalSnapshot>,
+    >,
     frame: &mut Frame,
 ) {
     render_panes(
@@ -129,6 +188,7 @@ pub(crate) fn render_tab_surface(
         surface.target,
         surface.pane_infos,
         surface.split_borders,
+        external_snapshots,
     );
 }
 
@@ -136,6 +196,9 @@ pub(crate) fn tab_surface_hyperlinks(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: TabSurfaceView<'_>,
+    external_snapshots: Option<
+        &HashMap<PaneId, crate::terminal::external::ExternalTerminalSnapshot>,
+    >,
 ) -> Vec<((u16, u16), String, String)> {
     let Some(ws_idx) = surface.target.map(|target| target.workspace_index) else {
         return Vec::new();
@@ -149,6 +212,27 @@ pub(crate) fn tab_surface_hyperlinks(
         if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         {
             links.extend(runtime.visible_hyperlinks(info.inner_rect));
+        } else if let Some(terminal_id) = app
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(info.id))
+        {
+            if let Some(snapshot) = external_snapshots.and_then(|snapshots| snapshots.get(&info.id))
+            {
+                links.extend(crate::terminal::external::external_hyperlinks(
+                    snapshot,
+                    info.inner_rect,
+                ));
+            } else if external_snapshots.is_none() {
+                if let Some(session) = terminal_runtimes.external_session(terminal_id) {
+                    if let Ok(snapshot) = session.render_snapshot() {
+                        links.extend(crate::terminal::external::external_hyperlinks(
+                            &snapshot,
+                            info.inner_rect,
+                        ));
+                    }
+                }
+            }
         }
     }
     links
@@ -158,53 +242,84 @@ pub(crate) fn tab_surface_cursor(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     surface: TabSurfaceView<'_>,
+    external_snapshots: Option<
+        &HashMap<PaneId, crate::terminal::external::ExternalTerminalSnapshot>,
+    >,
 ) -> Option<CursorState> {
     let ws_idx = surface.target?.workspace_index;
     let info = surface.pane_infos.iter().find(|info| info.is_focused)?;
     if !app.pane_exposes_host_cursor(ws_idx, info.id) {
         return None;
     }
-    let runtime = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)?;
-    if runtime.synchronized_output_active() {
-        return None;
-    }
-    let scrolled_back = super::panes::pane_is_scrolled_back(runtime);
-    let reveal = app.reveal_hidden_cursor_for_cjk_ime
-        && (!app.cjk_ime_agent_filter_configured || {
-            let detected = app
-                .workspaces
-                .get(ws_idx)
-                .and_then(|ws| ws.terminal_id(info.id))
-                .and_then(|terminal_id| app.terminals.get(terminal_id))
-                .and_then(|terminal| terminal.detected_agent);
-            detected.is_some_and(|agent| app.cjk_ime_agents.contains(&agent))
-        });
+    let terminal_id = app.workspaces.get(ws_idx)?.terminal_id(info.id)?;
+    if let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+        if runtime.synchronized_output_active() {
+            return None;
+        }
+        let scrolled_back = super::panes::pane_is_scrolled_back(runtime);
+        let reveal = app.reveal_hidden_cursor_for_cjk_ime
+            && (!app.cjk_ime_agent_filter_configured || {
+                let detected = app
+                    .terminals
+                    .get(terminal_id)
+                    .and_then(|terminal| terminal.detected_agent);
+                detected.is_some_and(|agent| app.cjk_ime_agents.contains(&agent))
+            });
 
-    if let Some(cursor) = runtime.cursor_state(info.inner_rect, true) {
-        let visible = if reveal {
-            !scrolled_back
-        } else {
-            cursor.visible && !scrolled_back
-        };
-        Some(CursorState {
-            x: cursor.x,
-            y: cursor.y,
-            visible,
-            shape: if reveal && visible {
-                app.cjk_ime_cursor_shape
+        if let Some(cursor) = runtime.cursor_state(info.inner_rect, true) {
+            let visible = if reveal {
+                !scrolled_back
             } else {
-                cursor.shape
-            },
-        })
-    } else if reveal && !scrolled_back {
-        Some(CursorState {
-            x: info.inner_rect.x,
-            y: info.inner_rect.y,
-            visible: true,
-            shape: app.cjk_ime_cursor_shape,
-        })
+                cursor.visible && !scrolled_back
+            };
+            Some(CursorState {
+                x: cursor.x,
+                y: cursor.y,
+                visible,
+                shape: if reveal && visible {
+                    app.cjk_ime_cursor_shape
+                } else {
+                    cursor.shape
+                },
+            })
+        } else if reveal && !scrolled_back {
+            Some(CursorState {
+                x: info.inner_rect.x,
+                y: info.inner_rect.y,
+                visible: true,
+                shape: app.cjk_ime_cursor_shape,
+            })
+        } else {
+            None
+        }
     } else {
-        None
+        let snapshot = if let Some(snapshots) = external_snapshots {
+            snapshots.get(&info.id)?.clone()
+        } else {
+            terminal_runtimes
+                .external_session(terminal_id)?
+                .render_snapshot()
+                .ok()?
+        };
+        if snapshot.modes.synchronized_output || snapshot.scroll.offset_from_bottom > 0 {
+            return None;
+        }
+        let cursor = snapshot.cursor?;
+        if matches!(
+            cursor.shape,
+            crate::terminal::external::ExternalCursorShape::Hidden
+        ) {
+            return None;
+        }
+        if cursor.x >= info.inner_rect.width || cursor.y >= info.inner_rect.height {
+            return None;
+        }
+        Some(CursorState {
+            x: info.inner_rect.x.saturating_add(cursor.x),
+            y: info.inner_rect.y.saturating_add(cursor.y),
+            visible: cursor.visible && info.is_focused,
+            shape: crate::terminal::external::cursor_shape(cursor.shape),
+        })
     }
 }
 
@@ -264,7 +379,13 @@ mod tests {
             Terminal::new(TestBackend::new(full_area.width, full_area.height)).unwrap();
         terminal
             .draw(|frame| {
-                render_tab_surface(&app, &TerminalRuntimeRegistry::new(), surface_view, frame)
+                render_tab_surface(
+                    &app,
+                    &TerminalRuntimeRegistry::new(),
+                    surface_view,
+                    None,
+                    frame,
+                )
             })
             .unwrap();
 
@@ -279,10 +400,13 @@ mod tests {
         assert!(rendered.contains("RIGHT"), "surface: {rendered:?}");
         assert!(!rendered.contains("shell-workspace"));
 
-        let links = tab_surface_hyperlinks(&app, &TerminalRuntimeRegistry::new(), surface_view);
+        let links =
+            tab_surface_hyperlinks(&app, &TerminalRuntimeRegistry::new(), surface_view, None);
         assert!(links
             .iter()
             .any(|(_, symbol, link)| { symbol == "L" && link == uri }));
-        assert!(tab_surface_cursor(&app, &TerminalRuntimeRegistry::new(), surface_view,).is_some());
+        assert!(
+            tab_surface_cursor(&app, &TerminalRuntimeRegistry::new(), surface_view, None).is_some()
+        );
     }
 }

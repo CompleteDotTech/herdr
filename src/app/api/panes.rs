@@ -14,7 +14,7 @@ use crate::api::schema::{
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
     PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
     PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneZoomResult, ReadSource, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -171,6 +171,30 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned();
+        if let Some(terminal_id) = terminal_id.as_ref() {
+            if let Some(session) = self
+                .terminal_runtimes
+                .external_session(terminal_id)
+                .cloned()
+            {
+                if let Err(error) = session.set_scroll_offset(
+                    usize::try_from(params.offset_from_bottom).unwrap_or(usize::MAX),
+                ) {
+                    return encode_error(id, "external_scroll_failed", error.to_string());
+                }
+                self.render_dirty.request_generic();
+                let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+                    return pane_not_found(id, &params.pane_id);
+                };
+                return encode_success(id, ResponseResult::PaneInfo { pane });
+            }
+        }
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
@@ -216,6 +240,38 @@ impl App {
                 format!("pane not found: {}", params.pane_id),
             ));
         };
+        if let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+        {
+            if let Some(session) = self.terminal_runtimes.external_session(terminal_id) {
+                let before = session.content_revision();
+                if params
+                    .content_revision
+                    .is_some_and(|revision| revision != before || !before.is_multiple_of(2))
+                {
+                    return Err(("stale_content", "pane content changed".to_owned()));
+                }
+                let text = session
+                    .selection_text(
+                        (params.anchor.row, params.anchor.col),
+                        (params.cursor.row, params.cursor.col),
+                        params.content_revision,
+                    )
+                    .map_err(|error| match error {
+                        crate::terminal::external::ExternalSessionError::RevisionExhausted => {
+                            ("stale_content", "pane content changed".to_owned())
+                        }
+                        error => ("selection_unavailable", error.to_string()),
+                    })?;
+                if params.content_revision.is_some() && session.content_revision() != before {
+                    return Err(("stale_content", "pane content changed".to_owned()));
+                }
+                return Ok(text);
+            }
+        }
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
@@ -274,6 +330,42 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(session) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .and_then(|terminal_id| self.terminal_runtimes.external_session(terminal_id))
+        {
+            let before = session.content_revision();
+            if params
+                .content_revision
+                .is_some_and(|revision| revision != before || !before.is_multiple_of(2))
+            {
+                return encode_error(id, "stale_content", "pane content changed");
+            }
+            let target =
+                external_copy_motion(session, params.cursor.row, params.cursor.col, params.motion);
+            let after = session.content_revision();
+            if after != before || !after.is_multiple_of(2) {
+                return encode_error(id, "stale_content", "pane content changed");
+            }
+            let Some(target) = target else {
+                return encode_error(
+                    id,
+                    "copy_motion_unavailable",
+                    "external terminal copy motion is unavailable",
+                );
+            };
+            return encode_success(
+                id,
+                ResponseResult::PaneCopyMotion {
+                    pane_id: params.pane_id,
+                    cursor: target,
+                    content_revision: after,
+                },
+            );
+        }
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
@@ -389,6 +481,53 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(session) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .and_then(|terminal_id| self.terminal_runtimes.external_session(terminal_id))
+        {
+            const MAX_QUERY_BYTES: usize = 4096;
+            const MAX_RETURNED_MATCHES: usize = 1024;
+            if params.query.len() > MAX_QUERY_BYTES {
+                return encode_error(id, "query_too_large", "copy search query is too large");
+            }
+            let before = session.content_revision();
+            if before != params.content_revision || !before.is_multiple_of(2) {
+                return encode_error(id, "stale_content", "pane content changed");
+            }
+            let result = external_copy_search(
+                session,
+                &params.query,
+                params.direction,
+                params.cursor,
+                params.previous,
+                MAX_RETURNED_MATCHES,
+            );
+            let after = session.content_revision();
+            if after != before || !after.is_multiple_of(2) {
+                return encode_error(id, "stale_content", "pane content changed");
+            }
+            let Some(result) = result else {
+                return encode_error(
+                    id,
+                    "copy_search_unavailable",
+                    "external terminal copy search is unavailable",
+                );
+            };
+            return encode_success(
+                id,
+                ResponseResult::PaneCopySearch {
+                    pane_id: params.pane_id,
+                    content_revision: after,
+                    matches: result.matches,
+                    total: result.total,
+                    current: result.current,
+                    current_global: result.current_global,
+                },
+            );
+        }
         let Some(runtime) =
             self.state
                 .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
@@ -1232,6 +1371,10 @@ impl App {
                     label,
                     tab_label,
                     identity_cwd,
+                    self.state
+                        .terminals
+                        .get(&source_terminal_id)
+                        .is_some_and(|terminal| terminal.external_binding.is_none()),
                     moved,
                     self.event_tx.clone(),
                     self.render_notify.clone(),
@@ -1357,17 +1500,25 @@ impl App {
                 self.render_dirty.clone(),
             );
         } else {
+            let local_filesystem_identity = self
+                .state
+                .terminals
+                .get(&moved.pane_state.attached_terminal_id)
+                .is_some_and(|terminal| terminal.external_binding.is_none());
             let mut workspace = crate::workspace::Workspace::from_existing_pane(
                 context.previous_workspace_label,
                 context.previous_tab_label,
                 context.identity_cwd,
+                local_filesystem_identity,
                 moved,
                 self.event_tx.clone(),
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
             );
             workspace.id = context.previous_workspace_id;
-            workspace.worktree_space = context.previous_worktree_space;
+            workspace.worktree_space = context
+                .previous_worktree_space
+                .filter(|_| local_filesystem_identity);
             let insert_idx = context.source_ws_idx.min(self.state.workspaces.len());
             if let Some(active) = self.state.active {
                 if active >= insert_idx {
@@ -1493,6 +1644,85 @@ impl App {
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .cloned();
+        if let Some(terminal_id) = terminal_id.as_ref() {
+            if let Some(session) = self
+                .terminal_runtimes
+                .external_session(terminal_id)
+                .cloned()
+            {
+                return match self.external_pane_read(
+                    ws_idx,
+                    pane_id,
+                    public_pane_id,
+                    params,
+                    &session,
+                ) {
+                    Ok(read) => encode_success(id, ResponseResult::PaneRead { read }),
+                    Err((code, message)) => encode_error(id, code, message),
+                };
+            }
+        }
+        if let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+            .filter(|terminal| terminal.external_binding.is_some())
+        {
+            if !matches!(
+                params.source,
+                ReadSource::Recent | ReadSource::RecentUnwrapped
+            ) {
+                return encode_error(
+                    id,
+                    "unsupported_transcript_read",
+                    "Transcript panes support recent or recent_unwrapped reads; native screen detection and viewport reads are unavailable.",
+                );
+            }
+            let Some(projection) = terminal.external_transcript.as_ref() else {
+                return encode_error(
+                    id,
+                    "transcript_unavailable",
+                    "This provider does not currently expose transcript output.",
+                );
+            };
+            let Some(tab_idx) = self.state.workspaces[ws_idx].find_tab_index_for_pane(pane_id)
+            else {
+                return pane_not_found(id, &params.pane_id);
+            };
+            let limit = params.lines.unwrap_or(80).min(1000) as usize;
+            let lines = projection.read_lines(limit);
+            let mut text = String::new();
+            for (index, line) in lines.iter().enumerate() {
+                if index > 0 {
+                    text.push('\n');
+                }
+                text.push_str(line.as_str());
+            }
+            return encode_success(
+                id,
+                ResponseResult::PaneRead {
+                    read: PaneReadResult {
+                        pane_id: public_pane_id,
+                        workspace_id: self.public_workspace_id(ws_idx),
+                        tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
+                        source: params.source,
+                        // The retained projection normalizes output to plain text.
+                        format: crate::api::schema::ReadFormat::Text,
+                        text,
+                        revision: projection.content_revision(),
+                        truncated: projection.has_omissions() || projection.line_count() > limit,
+                    },
+                },
+            );
+        }
         let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1526,6 +1756,99 @@ impl App {
                 },
             },
         )
+    }
+
+    fn external_pane_read(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        public_pane_id: String,
+        params: PaneReadParams,
+        session: &crate::terminal::external::ExternalTerminalSession,
+    ) -> Result<PaneReadResult, (&'static str, String)> {
+        use crate::api::schema::{ReadFormat, ReadSource};
+
+        if params.format != ReadFormat::Text {
+            return Err((
+                "unsupported_external_read_format",
+                "external terminal reads currently expose text only; ANSI export is unavailable"
+                    .to_owned(),
+            ));
+        }
+        if params.source == ReadSource::Detection {
+            return Err((
+                "unsupported_external_read_source",
+                "external terminal detection reads are unavailable".to_owned(),
+            ));
+        }
+        let Some(tab_idx) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.find_tab_index_for_pane(pane_id))
+        else {
+            return Err(("pane_not_found", "pane not found".to_owned()));
+        };
+
+        let (mut lines, mut truncated, revision) = match params.source {
+            ReadSource::Visible => {
+                let snapshot = session
+                    .render_snapshot()
+                    .map_err(|error| ("external_read_failed", error.to_string()))?;
+                let mut lines = snapshot.visible_lines();
+                while lines.last().is_some_and(|line| line.text.is_empty()) {
+                    lines.pop();
+                }
+                (lines, false, snapshot.content_revision)
+            }
+            ReadSource::Recent | ReadSource::RecentUnwrapped => session
+                .recent_lines_with_revision(params.lines.unwrap_or(80).min(1000) as usize)
+                .map_err(|error| ("external_read_failed", error.to_string()))?,
+            ReadSource::Detection => unreachable!(),
+        };
+        if let Some(limit) = params.lines {
+            let limit = limit.min(1000) as usize;
+            truncated |= lines.len() > limit;
+            let start = lines.len().saturating_sub(limit);
+            lines = lines.split_off(start);
+        }
+        let text = Self::external_lines_to_text(&lines, params.source);
+        Ok(PaneReadResult {
+            pane_id: public_pane_id,
+            workspace_id: self.public_workspace_id(ws_idx),
+            tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap_or_default(),
+            source: params.source,
+            format: ReadFormat::Text,
+            text,
+            revision,
+            truncated,
+        })
+    }
+
+    /// Keep the native read contracts at the API boundary. `Recent` is a
+    /// rendered-row stream and therefore ends each returned row with a
+    /// newline. `RecentUnwrapped` joins WRAPLINE continuations and omits the
+    /// final logical-line newline, matching the model's unwrapped screen
+    /// formatter. Visible reads preserve physical rows and end with a newline
+    /// after each non-continuation row.
+    fn external_lines_to_text(
+        lines: &[crate::terminal::external::ExternalReadLine],
+        source: crate::api::schema::ReadSource,
+    ) -> String {
+        use crate::api::schema::ReadSource;
+
+        let mut text = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            text.push_str(&line.text);
+            let is_last = index + 1 == lines.len();
+            if source == ReadSource::Recent
+                || (source == ReadSource::Visible && !line.soft_wrapped)
+                || (source == ReadSource::RecentUnwrapped && !line.soft_wrapped && !is_last)
+            {
+                text.push('\n');
+            }
+        }
+        text
     }
 
     pub(super) fn handle_pane_report_agent(
@@ -2102,6 +2425,326 @@ impl From<PaneDirection> for NavDirection {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ExternalCopySearchResult {
+    matches: Vec<PaneTextRange>,
+    total: u64,
+    current: Option<u32>,
+    current_global: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalTextClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExternalTextAtom {
+    point: PaneTextPoint,
+    class: ExternalTextClass,
+}
+
+fn external_copy_motion(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    row: u32,
+    col: u16,
+    motion: PaneCopyMotion,
+) -> Option<PaneTextPoint> {
+    let snapshot = session.render_snapshot().ok()?;
+    let top = snapshot
+        .scroll
+        .history_rows
+        .saturating_sub(snapshot.scroll.offset_from_bottom);
+    let local_row = usize::try_from(row.saturating_sub(u32::try_from(top).ok()?))
+        .ok()?
+        .min(snapshot.rows.len().saturating_sub(1));
+    let absolute_row = u32::try_from(top.saturating_add(local_row)).ok()?;
+    let cells = snapshot.rows.get(local_row)?.cells.as_slice();
+    let atoms = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(column, cell)| {
+            if matches!(
+                cell.width,
+                crate::terminal::external::ExternalCellWidth::WideSpacer
+                    | crate::terminal::external::ExternalCellWidth::LeadingWideSpacer
+            ) {
+                return None;
+            }
+            let ch = cell.base;
+            let class = if ch.is_whitespace() {
+                ExternalTextClass::Whitespace
+            } else if ch.is_ascii_punctuation() {
+                ExternalTextClass::Punctuation
+            } else {
+                ExternalTextClass::Word
+            };
+            Some(ExternalTextAtom {
+                point: PaneTextPoint {
+                    row: absolute_row,
+                    col: u16::try_from(column).ok()?,
+                },
+                class,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if matches!(
+        motion,
+        PaneCopyMotion::LineEnd | PaneCopyMotion::FirstNonBlank
+    ) {
+        let mut nonblank = atoms
+            .iter()
+            .filter(|atom| atom.class != ExternalTextClass::Whitespace);
+        let target = match motion {
+            PaneCopyMotion::LineEnd => nonblank.next_back(),
+            PaneCopyMotion::FirstNonBlank => nonblank.next(),
+            _ => unreachable!(),
+        }?;
+        return Some(target.point);
+    }
+
+    let current = atoms
+        .iter()
+        .position(|atom| atom.point.col >= col)
+        .or_else(|| atoms.len().checked_sub(1))?;
+    let point_at = |index: usize| atoms.get(index).map(|atom| atom.point);
+    let skip_whitespace = |mut index: usize| {
+        while atoms
+            .get(index)
+            .is_some_and(|atom| atom.class == ExternalTextClass::Whitespace)
+        {
+            index = index.saturating_add(1);
+        }
+        index
+    };
+    let target = match motion {
+        PaneCopyMotion::NextWordStart => {
+            let mut index = current.saturating_add(1);
+            if atoms
+                .get(current)
+                .is_some_and(|atom| atom.class != ExternalTextClass::Whitespace)
+            {
+                let class = atoms[current].class;
+                while atoms.get(index).is_some_and(|atom| atom.class == class) {
+                    index = index.saturating_add(1);
+                }
+            }
+            point_at(skip_whitespace(index))
+        }
+        PaneCopyMotion::PreviousWordStart => {
+            let mut index = current.checked_sub(1)?;
+            while atoms
+                .get(index)
+                .is_some_and(|atom| atom.class == ExternalTextClass::Whitespace)
+            {
+                index = index.checked_sub(1)?;
+            }
+            let class = atoms.get(index)?.class;
+            while index > 0 && atoms[index - 1].class == class {
+                index -= 1;
+            }
+            point_at(index)
+        }
+        PaneCopyMotion::NextWordEnd => {
+            let mut index = skip_whitespace(current.saturating_add(1));
+            let class = atoms.get(index)?.class;
+            while atoms
+                .get(index.saturating_add(1))
+                .is_some_and(|atom| atom.class == class)
+            {
+                index = index.saturating_add(1);
+            }
+            point_at(index)
+        }
+        PaneCopyMotion::NextBigWordStart => {
+            let mut index = current.saturating_add(1);
+            if atoms
+                .get(current)
+                .is_some_and(|atom| atom.class != ExternalTextClass::Whitespace)
+            {
+                while atoms
+                    .get(index)
+                    .is_some_and(|atom| atom.class != ExternalTextClass::Whitespace)
+                {
+                    index = index.saturating_add(1);
+                }
+            }
+            point_at(skip_whitespace(index))
+        }
+        PaneCopyMotion::PreviousBigWordStart => {
+            let mut index = current.checked_sub(1)?;
+            while atoms
+                .get(index)
+                .is_some_and(|atom| atom.class == ExternalTextClass::Whitespace)
+            {
+                index = index.checked_sub(1)?;
+            }
+            while index > 0 && atoms[index - 1].class != ExternalTextClass::Whitespace {
+                index -= 1;
+            }
+            point_at(index)
+        }
+        PaneCopyMotion::NextBigWordEnd => {
+            let mut index = skip_whitespace(current.saturating_add(1));
+            atoms.get(index)?;
+            while atoms
+                .get(index.saturating_add(1))
+                .is_some_and(|atom| atom.class != ExternalTextClass::Whitespace)
+            {
+                index = index.saturating_add(1);
+            }
+            point_at(index)
+        }
+        PaneCopyMotion::PreviousParagraph | PaneCopyMotion::NextParagraph => {
+            let direction: isize = if motion == PaneCopyMotion::PreviousParagraph {
+                -1
+            } else {
+                1
+            };
+            let mut index = local_row as isize + direction;
+            while index >= 0 && (index as usize) < snapshot.rows.len() {
+                let line = &snapshot.rows[index as usize];
+                let blank = line.cells.iter().all(|cell| {
+                    matches!(
+                        cell.width,
+                        crate::terminal::external::ExternalCellWidth::WideSpacer
+                            | crate::terminal::external::ExternalCellWidth::LeadingWideSpacer
+                    ) || cell.base.is_whitespace()
+                });
+                if blank {
+                    return Some(PaneTextPoint {
+                        row: u32::try_from(top.saturating_add(index as usize)).ok()?,
+                        col: 0,
+                    });
+                }
+                index += direction;
+            }
+            None
+        }
+        PaneCopyMotion::LineEnd | PaneCopyMotion::FirstNonBlank => None,
+    }?;
+    Some(target)
+}
+
+fn external_copy_search(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    query: &str,
+    direction: PaneCopySearchDirection,
+    cursor: PaneTextPoint,
+    previous: Option<PaneTextRange>,
+    limit: usize,
+) -> Option<ExternalCopySearchResult> {
+    if query.is_empty() || limit == 0 {
+        return Some(ExternalCopySearchResult {
+            matches: Vec::new(),
+            total: 0,
+            current: None,
+            current_global: None,
+        });
+    }
+    let snapshot = session.render_snapshot().ok()?;
+    let top = snapshot
+        .scroll
+        .history_rows
+        .saturating_sub(snapshot.scroll.offset_from_bottom);
+    let case_sensitive = query.chars().any(char::is_uppercase);
+    let needle = if case_sensitive {
+        query.to_owned()
+    } else {
+        query.to_ascii_lowercase()
+    };
+    let mut all = Vec::new();
+    for (row_index, row) in snapshot.rows.iter().enumerate() {
+        let mut text = String::new();
+        let mut columns = Vec::new();
+        for (column, cell) in row.cells.iter().enumerate() {
+            if matches!(
+                cell.width,
+                crate::terminal::external::ExternalCellWidth::WideSpacer
+                    | crate::terminal::external::ExternalCellWidth::LeadingWideSpacer
+            ) {
+                continue;
+            }
+            text.push(cell.base);
+            columns.push(u16::try_from(column).ok()?);
+        }
+        let haystack = if case_sensitive {
+            text.clone()
+        } else {
+            text.to_ascii_lowercase()
+        };
+        if needle.is_empty() {
+            continue;
+        }
+        let mut offset = 0usize;
+        while let Some(found) = haystack.get(offset..)?.find(&needle) {
+            let start = offset.saturating_add(found);
+            let end = start.saturating_add(needle.len());
+            let start_char = haystack[..start].chars().count();
+            let end_char = haystack[..end].chars().count().saturating_sub(1);
+            let Some(&start_col) = columns.get(start_char) else {
+                break;
+            };
+            let Some(&end_col) = columns.get(end_char) else {
+                break;
+            };
+            let row = u32::try_from(top.saturating_add(row_index)).ok()?;
+            all.push(PaneTextRange {
+                start: PaneTextPoint {
+                    row,
+                    col: start_col,
+                },
+                end: PaneTextPoint { row, col: end_col },
+            });
+            offset = end.max(start.saturating_add(1));
+            if offset >= haystack.len() {
+                break;
+            }
+        }
+    }
+    let total = u64::try_from(all.len()).ok()?;
+    if all.is_empty() {
+        return Some(ExternalCopySearchResult {
+            matches: Vec::new(),
+            total,
+            current: None,
+            current_global: None,
+        });
+    }
+    let origin = match direction {
+        PaneCopySearchDirection::Forward => previous.map_or(cursor, |range| range.end),
+        PaneCopySearchDirection::Backward => previous.map_or(cursor, |range| range.start),
+    };
+    let target = match direction {
+        PaneCopySearchDirection::Forward => all
+            .iter()
+            .position(|range| (range.start.row, range.start.col) > (origin.row, origin.col))
+            .unwrap_or(0),
+        PaneCopySearchDirection::Backward => all
+            .iter()
+            .rposition(|range| (range.end.row, range.end.col) < (origin.row, origin.col))
+            .unwrap_or(all.len().saturating_sub(1)),
+    };
+    let retained = limit.min(all.len());
+    let start = target
+        .saturating_sub(retained / 2)
+        .min(all.len().saturating_sub(retained));
+    let matches = all
+        .into_iter()
+        .skip(start)
+        .take(retained)
+        .collect::<Vec<_>>();
+    Some(ExternalCopySearchResult {
+        matches,
+        total,
+        current: u32::try_from(target.saturating_sub(start)).ok(),
+        current_global: u64::try_from(target).ok(),
+    })
+}
+
 enum ResolvedPaneMoveDestination {
     ExistingTab {
         tab_id: String,
@@ -2279,6 +2922,31 @@ mod tests {
         );
         app.state.insert_test_runtime(pane_id, runtime);
         (app, public_pane_id, pane_id)
+    }
+
+    #[test]
+    fn external_read_formatter_preserves_recent_newline_contracts() {
+        let lines = [
+            crate::terminal::external::ExternalReadLine {
+                text: "ABCDE".into(),
+                model_row: 4,
+                soft_wrapped: true,
+            },
+            crate::terminal::external::ExternalReadLine {
+                text: "FGHIJ".into(),
+                model_row: 5,
+                soft_wrapped: false,
+            },
+        ];
+
+        assert_eq!(
+            App::external_lines_to_text(&lines, ReadSource::Recent),
+            "ABCDE\nFGHIJ\n"
+        );
+        assert_eq!(
+            App::external_lines_to_text(&lines, ReadSource::RecentUnwrapped),
+            "ABCDEFGHIJ"
+        );
     }
 
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {

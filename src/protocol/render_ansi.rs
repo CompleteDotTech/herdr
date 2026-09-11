@@ -473,6 +473,7 @@ fn cells_equal(a: &CellData, b: &CellData) -> bool {
         && a.fg == b.fg
         && a.bg == b.bg
         && a.modifier == b.modifier
+        && a.width == b.width
         && a.hyperlink == b.hyperlink
     // Skip flag is only for ratatui internal use, not visual.
 }
@@ -729,7 +730,11 @@ fn cell_width(cell: &CellData) -> usize {
     if is_halfwidth_katakana_voiced_grapheme(&cell.symbol) {
         return 2;
     }
-    cell.symbol.width()
+    if cell.width != 0 {
+        usize::from(cell.width)
+    } else {
+        cell.symbol.width()
+    }
 }
 
 fn is_halfwidth_katakana_voiced_grapheme(symbol: &str) -> bool {
@@ -969,6 +974,7 @@ fn cells_visually_equal(
         && cell.fg == prev_cell.fg
         && cell.bg == prev_cell.bg
         && cell.modifier == prev_cell.modifier
+        && cell.width == prev_cell.width
         && sanitized_cell_hyperlink_uri(sanitized_hyperlinks, cell)
             == sanitized_cell_hyperlink_uri(prev_sanitized_hyperlinks, prev_cell)
     // Skip flag is only for ratatui internal use, not visual.
@@ -1049,6 +1055,7 @@ mod tests {
             modifier,
             skip: false,
             hyperlink: None,
+            width: 0,
         }
     }
 

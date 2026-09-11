@@ -48,6 +48,21 @@ pub enum ResponseResult {
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
     },
+    RuntimeProviderList {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostic: Option<String>,
+        providers: Vec<super::runtime_providers::RuntimeProviderInfo>,
+    },
+    RuntimeProviderInfo {
+        provider: super::runtime_providers::RuntimeProviderInfo,
+    },
+    RuntimeProviderAttachment {
+        attachment: super::runtime_providers::ProviderAttachmentInfo,
+    },
+    RuntimeProviderOperation {
+        operation: super::runtime_providers::RuntimeProviderOperationInfo,
+    },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
     },

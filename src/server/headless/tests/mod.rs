@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "pane_graphics.rs"]
 mod pane_graphics_tests;
+#[path = "surface_codec.rs"]
+mod surface_codec_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
 
@@ -600,6 +602,7 @@ async fn client_shell_attach_seeds_workspace() {
 
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 6,
             surface_cols: 80,
             surface_rows: 23,
@@ -630,6 +633,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
     let client_id = 41;
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id,
             surface_cols: 80,
             surface_rows: 23,
@@ -766,6 +770,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 7,
             surface_cols: 80,
             surface_rows: 23,
@@ -910,6 +915,7 @@ fn connect_test_shell(
     let (writer, control, render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id,
             surface_cols,
             surface_rows,
@@ -1236,6 +1242,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (local_writer, local_control, _local_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 13,
             surface_cols: 80,
             surface_rows: 23,
@@ -1260,6 +1267,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
     let (endpoint_writer, endpoint_control, _endpoint_render) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 14,
             surface_cols: 80,
             surface_rows: 23,
@@ -1959,6 +1967,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 9,
             surface_cols: 80,
             surface_rows: 23,
@@ -2209,6 +2218,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
     let (writer, control_rx, render_rx) = test_client_writer();
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             client_id: 12,
             surface_cols: 80,
             surface_rows: 23,
@@ -3030,14 +3040,14 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
             };
 
             assert_eq!(
-                    server.agent_read_not_idle_error(&request),
-                    Some(api::schema::ErrorBody {
-                        code: "agent_not_idle".into(),
-                        message: format!(
-                            "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
-                        ),
-                    })
-                );
+                server.agent_read_not_idle_error(&request),
+                Some(api::schema::ErrorBody {
+                    code: "agent_not_idle".into(),
+                    message: format!(
+                        "cannot read 200 lines while {public_pane_id} is working: its alternate-screen history can only be captured by scrolling while idle. Wait and retry, or use --source visible"
+                    ),
+                })
+            );
 
             let mut default_request = request.clone();
             let api::schema::Method::AgentRead(params) = &mut default_request.method else {
@@ -3332,11 +3342,11 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
             .contains_key(&terminal_id_string));
         let reason = read_server_shutdown_reason(control_rx.recv().expect("shutdown message"));
         assert_eq!(
-                reason,
-                Some(format!(
-                    "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
-                ))
-            );
+            reason,
+            Some(format!(
+                "terminal attach failed: terminal {terminal_id_string} has a read in progress; retry"
+            ))
+        );
     });
 }
 

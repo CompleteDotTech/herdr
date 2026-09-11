@@ -237,6 +237,7 @@ impl Workspace {
         label: Option<String>,
         tab_label: Option<String>,
         identity_cwd: PathBuf,
+        local_filesystem_identity: bool,
         moved: MovedPane,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
@@ -248,7 +249,16 @@ impl Workspace {
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(root_pane, 1);
         let (cached_git_space, cached_auto_label, cached_git_status_key) =
-            discover_workspace_git_identity(&identity_cwd);
+            if local_filesystem_identity {
+                discover_workspace_git_identity(&identity_cwd)
+            } else {
+                (None, "Coven".to_owned(), identity_cwd.clone())
+            };
+        let cached_git_branch = if local_filesystem_identity {
+            git_branch(&identity_cwd)
+        } else {
+            None
+        };
         Self {
             id,
             custom_name: label,
@@ -256,7 +266,7 @@ impl Workspace {
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label,
             cached_git_status_key,
-            cached_git_branch: git_branch(&identity_cwd),
+            cached_git_branch,
             cached_git_ahead_behind: None,
             cached_git_space,
             worktree_space: None,
@@ -1017,6 +1027,16 @@ impl Workspace {
         terminals: &HashMap<TerminalId, TerminalState>,
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
+        if self
+            .tabs
+            .first()
+            .and_then(|tab| tab.terminal_id(tab.root_pane))
+            .and_then(|id| terminals.get(id))
+            .is_some_and(|terminal| terminal.external_binding.is_some())
+        {
+            // Remote path text is not a local filesystem/Git identity.
+            return None;
+        }
         self.tabs
             .first()
             .and_then(|tab| tab.cwd_for_pane(tab.root_pane, terminals, terminal_runtimes))
@@ -1061,7 +1081,7 @@ impl Workspace {
 
         self.resolved_identity_cwd_from(terminals, terminal_runtimes)
             .map(|cwd| self.automatic_display_name_for_cwd(&cwd))
-            .unwrap_or_else(|| "workspace".into())
+            .unwrap_or_else(|| self.cached_auto_label.clone())
     }
 
     fn automatic_display_name_for_cwd(&self, cwd: &std::path::Path) -> String {

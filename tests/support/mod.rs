@@ -749,12 +749,17 @@ fn runtime_dir_owner_alive(runtime_dir: &Path) -> bool {
     process_exists(owner_pid)
 }
 
-fn current_checkout_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn test_herdr_binary() -> Option<&'static Path> {
+    static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BINARY
+        .get_or_init(|| fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).ok())
+        .as_deref()
 }
 
 fn is_test_herdr_binary(path: &Path) -> bool {
-    path.ends_with("target/debug/herdr") && path.starts_with(current_checkout_root())
+    // /proc resolves symlinks. Match exactly the executable Cargo built for
+    // this suite, including when CARGO_TARGET_DIR is outside the checkout.
+    test_herdr_binary().is_some_and(|binary| path == binary)
 }
 
 extern "C" fn run_atexit_cleanup() {
@@ -877,12 +882,19 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_matcher_accepts_current_checkout_debug_binary() {
-        let binary = current_checkout_root().join("target/debug/herdr");
+    fn test_binary_matcher_accepts_exact_cargo_binary() {
+        let binary = fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).unwrap();
         assert!(
             is_test_herdr_binary(&binary),
-            "current checkout debug binary should be considered test-owned"
+            "exact Cargo binary should be considered test-owned"
         );
+    }
+
+    #[test]
+    fn test_binary_matcher_rejects_another_target_with_the_same_name() {
+        assert!(!is_test_herdr_binary(Path::new(
+            "/other-checkout/target/debug/herdr"
+        )));
     }
 
     #[test]

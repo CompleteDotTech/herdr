@@ -16,10 +16,9 @@ struct PendingAgentResumeCandidate {
 
 impl App {
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
-        self.state
-            .terminals
-            .values()
-            .any(|terminal| terminal.pending_agent_resume_plan.is_some())
+        self.state.terminals.values().any(|terminal| {
+            terminal.external_binding.is_none() && terminal.pending_agent_resume_plan.is_some()
+        })
     }
 
     pub(crate) fn sync_pending_agent_resume_deadline(&mut self, now: Instant) {
@@ -101,6 +100,9 @@ impl App {
                     else {
                         continue;
                     };
+                    if terminal.external_binding.is_some() {
+                        continue;
+                    }
                     let Some(plan) = terminal.pending_agent_resume_plan.clone() else {
                         continue;
                     };
@@ -212,6 +214,14 @@ impl App {
         cols: u16,
         allow_empty_theme: bool,
     ) -> bool {
+        if self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .is_none_or(|terminal| terminal.external_binding.is_some())
+        {
+            return false;
+        }
         let host_terminal_theme = self.state.host_terminal_theme;
         if host_terminal_theme.is_empty() && !allow_empty_theme {
             return false;

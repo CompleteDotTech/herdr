@@ -713,17 +713,31 @@ pub struct CellData {
     pub skip: bool,
     /// Index into `FrameData::hyperlinks` for this cell's OSC 8 target, if any.
     pub hyperlink: Option<u32>,
+    /// Explicit display width captured from ratatui's ForcedWidth marker.
+    ///
+    /// Generation-1 frames do not carry this field on the wire. It is an
+    /// owner-local side channel used while constructing a named generation-2
+    /// frame; keeping it skipped preserves the frozen generation-1 codec.
+    #[serde(skip, default)]
+    pub width: u16,
 }
 
 impl CellData {
     pub(crate) fn from_ratatui_cell(cell: &ratatui::buffer::Cell) -> Self {
+        let width = match cell.diff_option {
+            ratatui::buffer::CellDiffOption::ForcedWidth(width) => width.get(),
+            ratatui::buffer::CellDiffOption::None
+            | ratatui::buffer::CellDiffOption::Skip
+            | ratatui::buffer::CellDiffOption::AlwaysUpdate => 0,
+        };
         Self {
             symbol: cell.symbol().to_owned(),
             fg: color_to_u32(cell.fg),
             bg: color_to_u32(cell.bg),
             modifier: modifier_to_u16(cell.modifier),
-            skip: cell.skip,
+            skip: matches!(cell.diff_option, ratatui::buffer::CellDiffOption::Skip),
             hyperlink: None,
+            width,
         }
     }
 }
@@ -875,7 +889,13 @@ impl FrameData {
                 cell.fg = u32_to_color(cell_data.fg);
                 cell.bg = u32_to_color(cell_data.bg);
                 cell.modifier = u16_to_modifier(cell_data.modifier);
-                cell.skip = cell_data.skip;
+                cell.set_diff_option(if cell_data.skip {
+                    ratatui::buffer::CellDiffOption::Skip
+                } else if let Some(width) = std::num::NonZeroU16::new(cell_data.width) {
+                    ratatui::buffer::CellDiffOption::ForcedWidth(width)
+                } else {
+                    ratatui::buffer::CellDiffOption::None
+                });
             }
         }
 
@@ -2337,6 +2357,7 @@ mod tests {
                     modifier: Modifier::BOLD.bits(),
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 },
                 CellData {
                     symbol: "i".into(),
@@ -2345,6 +2366,7 @@ mod tests {
                     modifier: Modifier::ITALIC.bits(),
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 },
                 CellData {
                     symbol: "!".into(),
@@ -2353,6 +2375,7 @@ mod tests {
                     modifier: (Modifier::BOLD | Modifier::UNDERLINED).bits(),
                     skip: false,
                     hyperlink: Some(0),
+                    width: 0,
                 },
                 CellData {
                     symbol: " ".into(),
@@ -2361,6 +2384,7 @@ mod tests {
                     modifier: Modifier::empty().bits(),
                     skip: true,
                     hyperlink: None,
+                    width: 0,
                 },
                 CellData {
                     symbol: "→".into(), // multi-byte grapheme
@@ -2369,6 +2393,7 @@ mod tests {
                     modifier: Modifier::REVERSED.bits(),
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 },
                 CellData {
                     symbol: "🦀".into(), // emoji, wide grapheme cluster
@@ -2377,6 +2402,7 @@ mod tests {
                     modifier: Modifier::empty().bits(),
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 },
             ],
             width: 3,
@@ -2437,6 +2463,7 @@ mod tests {
                     modifier: 3,
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 }],
             }],
             panes: Vec::new(),
@@ -2908,6 +2935,7 @@ mod tests {
                 modifier: ((i % 16) as u16),
                 skip: i % 100 == 0,
                 hyperlink: None,
+                width: 0,
             })
             .collect();
 
@@ -3257,6 +3285,31 @@ mod tests {
     }
 
     #[test]
+    fn generation1_frame_codec_ignores_local_width_side_channel() {
+        let mut frame = FrameData {
+            cells: vec![CellData {
+                symbol: "界".into(),
+                fg: color_to_u32(Color::Reset),
+                bg: color_to_u32(Color::Reset),
+                modifier: 0,
+                skip: false,
+                hyperlink: None,
+                width: 0,
+            }],
+            width: 1,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let baseline = bincode::serde::encode_to_vec(&frame, bincode::config::standard()).unwrap();
+        frame.cells[0].width = 2;
+        let local_width =
+            bincode::serde::encode_to_vec(&frame, bincode::config::standard()).unwrap();
+        assert_eq!(baseline, local_width);
+    }
+
+    #[test]
     fn frame_data_rejects_mismatched_cell_count() {
         let frame = FrameData {
             cells: vec![
@@ -3267,6 +3320,7 @@ mod tests {
                     modifier: 0,
                     skip: false,
                     hyperlink: None,
+                    width: 0,
                 };
                 5
             ], // 5 cells but 3×2 = 6 expected

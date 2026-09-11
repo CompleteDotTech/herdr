@@ -24,6 +24,7 @@ pub(crate) trait EndpointTransport: Send {
 pub(crate) struct EndpointNegotiation {
     methods: HashSet<String>,
     capabilities: HashSet<String>,
+    pub(crate) surface_codec: crate::protocol::surface::SurfaceCodec,
 }
 
 impl EndpointNegotiation {
@@ -31,7 +32,16 @@ impl EndpointNegotiation {
         Self {
             methods: methods.into_iter().collect(),
             capabilities: capabilities.into_iter().collect(),
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
         }
+    }
+
+    pub(crate) fn with_surface_codec(
+        mut self,
+        codec: crate::protocol::surface::SurfaceCodec,
+    ) -> Self {
+        self.surface_codec = codec;
+        self
     }
 
     pub(crate) fn methods(&self) -> Vec<String> {

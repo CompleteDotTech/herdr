@@ -3934,6 +3934,298 @@
           ],
           "type": "object"
         },
+        "RuntimeProviderAttachParams": {
+          "additionalProperties": false,
+          "description": "Requests an owner-configured provider execution to be attached to a Herdr terminal.\n\nThe provider id selects trusted owner-local configuration; the request does not carry a\ndaemon path, executable, environment, or credential material.",
+          "properties": {
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider_id",
+            "session_id",
+            "generation"
+          ],
+          "type": "object"
+        },
+        "RuntimeProviderAttachmentTarget": {
+          "additionalProperties": false,
+          "description": "Selects a provider attachment by its durable Herdr terminal id.",
+          "properties": {
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        "RuntimeProviderExecuteParams": {
+          "additionalProperties": false,
+          "description": "A permission-bearing execution request. Provider scope and authority are\nselected from owner-local configuration; callers provide only the typed\nintent payload.",
+          "properties": {
+            "expires_at": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "intent": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderExecutionIntent"
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider_id",
+            "request_id",
+            "expires_at",
+            "intent"
+          ],
+          "type": "object"
+        },
+        "RuntimeProviderExecutionIntent": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cwd": {
+                  "type": "string"
+                },
+                "harness": {
+                  "$ref": "#/schemas/request/$defs/RuntimeProviderHarness"
+                },
+                "kind": {
+                  "const": "launch",
+                  "type": "string"
+                },
+                "mode": {
+                  "$ref": "#/schemas/request/$defs/RuntimeProviderMode"
+                },
+                "model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "prompt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "harness",
+                "mode",
+                "cwd",
+                "prompt"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "turn",
+                  "type": "string"
+                },
+                "prompt": {
+                  "type": "string"
+                },
+                "terminalId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "terminalId",
+                "prompt"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "continue",
+                  "type": "string"
+                },
+                "prompt": {
+                  "type": "string"
+                },
+                "terminalId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "terminalId",
+                "prompt"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "stop",
+                  "type": "string"
+                },
+                "terminalId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "terminalId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RuntimeProviderExecutionTarget": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "launch",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "kind": {
+                  "const": "existing",
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "sessionId",
+                "generation"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "continuation",
+                  "type": "string"
+                },
+                "previousGeneration": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "previousSessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "previousSessionId",
+                "previousGeneration"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "RuntimeProviderHarness": {
+          "enum": [
+            "codex",
+            "claude",
+            "copilot"
+          ],
+          "type": "string"
+        },
+        "RuntimeProviderMode": {
+          "enum": [
+            "transcript",
+            "terminal"
+          ],
+          "type": "string"
+        },
+        "RuntimeProviderOperationGetParams": {
+          "additionalProperties": false,
+          "description": "Reconcile a request after an uncertain response or Herdr restart. The\nexpected digest and target are required so an old request cannot be\nmistaken for a different execution with the same request id.",
+          "properties": {
+            "expected_target": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderExecutionTarget"
+            },
+            "payload_digest": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider_id",
+            "request_id",
+            "payload_digest",
+            "expected_target"
+          ],
+          "type": "object"
+        },
+        "RuntimeProviderTarget": {
+          "additionalProperties": false,
+          "description": "Selects one owner-configured provider instance.",
+          "properties": {
+            "provider_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider_id"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4835,6 +5127,118 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.attach",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderAttachParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.attachment.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderAttachmentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.detach",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderAttachmentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.execute",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderExecuteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "runtime_provider.operation.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderOperationGetParams"
             }
           },
           "required": [
@@ -9171,6 +9575,99 @@
             }
           ]
         },
+        "ProviderAttachmentInfo": {
+          "description": "A provider-backed terminal attachment projection.\n\nLifecycle, activity, connection, and durability remain independent axes. They are strings at\nthis API boundary so a future server can add values without changing the endpoint codec.",
+          "properties": {
+            "activity": {
+              "type": "string"
+            },
+            "attached": {
+              "type": "boolean"
+            },
+            "connection": {
+              "type": "string"
+            },
+            "diagnostic": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "durability": {
+              "type": "string"
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "lifecycle": {
+              "type": "string"
+            },
+            "observation_age_ms": {
+              "description": "Age of the last validated source reply in this Herdr process.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "observation_source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "profile_id": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "source_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "source_ledger_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "provider_id",
+            "host_id",
+            "project_id",
+            "profile_id",
+            "session_id",
+            "generation",
+            "attached",
+            "lifecycle",
+            "activity",
+            "connection",
+            "durability"
+          ],
+          "type": "object"
+        },
         "ReadFormat": {
           "enum": [
             "text",
@@ -9219,6 +9716,83 @@
                 "type",
                 "version",
                 "protocol"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "diagnostic": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "providers": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/RuntimeProviderInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "runtime_provider_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "enabled",
+                "providers"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "provider": {
+                  "$ref": "#/schemas/success_response/$defs/RuntimeProviderInfo"
+                },
+                "type": {
+                  "const": "runtime_provider_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "provider"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "attachment": {
+                  "$ref": "#/schemas/success_response/$defs/ProviderAttachmentInfo"
+                },
+                "type": {
+                  "const": "runtime_provider_attachment",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "attachment"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "operation": {
+                  "$ref": "#/schemas/success_response/$defs/RuntimeProviderOperationInfo"
+                },
+                "type": {
+                  "const": "runtime_provider_operation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "operation"
               ],
               "type": "object"
             },
@@ -10522,6 +11096,148 @@
               "type": "object"
             }
           ]
+        },
+        "RuntimeProviderInfo": {
+          "description": "One configured owner-local provider and the capabilities exposed by its current projection.",
+          "properties": {
+            "authority_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "authority_id": {
+              "type": "string"
+            },
+            "capabilities": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "policy_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "profile_id": {
+              "type": "string"
+            },
+            "project_id": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider_id",
+            "host_id",
+            "project_id",
+            "profile_id",
+            "policy_generation",
+            "authority_id",
+            "authority_generation",
+            "enabled",
+            "capabilities"
+          ],
+          "type": "object"
+        },
+        "RuntimeProviderOperationInfo": {
+          "description": "Prompt-free operation status. `status` is local observation state while the\noptional outcome fields retain the daemon's independently validated result.",
+          "properties": {
+            "delivery": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "diagnostic": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "parent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "payload_digest": {
+              "type": "string"
+            },
+            "provider_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ticket": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "provider_id",
+            "request_id",
+            "ticket",
+            "payload_digest",
+            "target",
+            "status"
+          ],
+          "type": "object"
         },
         "ServerCapabilities": {
           "properties": {
