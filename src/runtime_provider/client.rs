@@ -470,7 +470,7 @@ impl CovenProviderClient {
             ),
             _ => unreachable!("terminal mutation action validated above"),
         };
-        let reply = self.send_terminal_control(identity, action)?;
+        let mut reply = self.send_terminal_control(identity, action)?;
         let pending = matches!(
             &reply.outcome,
             TerminalControlOutcome::Mutation {
@@ -519,6 +519,10 @@ impl CovenProviderClient {
                         ..
                     }
                 ) {
+                    // Return the terminal receipt observed by the idempotent
+                    // poll when it settled. Never submit the mutation again;
+                    // the original sequence remains the sole side effect key.
+                    reply = polled;
                     break;
                 }
             }
