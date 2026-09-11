@@ -69,6 +69,9 @@ fn main() {
         // do not vary merely because the build was started again.
         .arg("--seed")
         .arg("0")
+        // libghostty-vt has concurrent generated-table/link steps; serialize
+        // them so independent clean builds cannot race on shared cache inputs.
+        .arg("-j1")
         .arg("-Demit-lib-vt")
         .arg(format!("-Doptimize={optimize}"))
         .arg(format!("-Dsimd={simd}"))
