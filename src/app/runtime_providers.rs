@@ -387,11 +387,10 @@ impl App {
             let pending_operation = poll.pending.and_then(|ticket| {
                 updates
                     .iter()
-                    .filter(|update| update.ticket == Some(ticket))
-                    .filter(|update| {
-                        !matches!(update.result, ProviderOperationResult::Pending { .. })
+                    .rfind(|update| {
+                        update.ticket == Some(ticket)
+                            && !matches!(update.result, ProviderOperationResult::Pending { .. })
                     })
-                    .last()
                     .map(|update| ProviderOperation {
                         ticket,
                         kind: update.kind,
