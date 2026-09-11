@@ -61,6 +61,7 @@ const RUNTIME_PROVIDER_METHODS: &[&str] = &[
     "runtime_provider.get",
     "runtime_provider.list",
     "runtime_provider.operation.get",
+    "runtime_provider.takeover",
 ];
 
 pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {

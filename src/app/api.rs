@@ -911,6 +911,9 @@ impl App {
             Method::RuntimeProviderAttach(params) => {
                 return self.handle_runtime_provider_attach(request.id, params);
             }
+            Method::RuntimeProviderTakeover(params) => {
+                return self.handle_runtime_provider_takeover(request.id, params);
+            }
             Method::RuntimeProviderAttachmentGet(params) => {
                 return self.handle_runtime_provider_attachment_get(request.id, params);
             }

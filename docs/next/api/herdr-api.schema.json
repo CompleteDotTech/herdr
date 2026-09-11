@@ -5186,6 +5186,22 @@
         {
           "properties": {
             "method": {
+              "const": "runtime_provider.takeover",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RuntimeProviderAttachmentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "runtime_provider.attachment.get",
               "type": "string"
             },

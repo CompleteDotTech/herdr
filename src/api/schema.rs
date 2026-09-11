@@ -65,6 +65,8 @@ pub enum Method {
     RuntimeProviderGet(RuntimeProviderTarget),
     #[serde(rename = "runtime_provider.attach")]
     RuntimeProviderAttach(RuntimeProviderAttachParams),
+    #[serde(rename = "runtime_provider.takeover")]
+    RuntimeProviderTakeover(RuntimeProviderAttachmentTarget),
     #[serde(rename = "runtime_provider.attachment.get")]
     RuntimeProviderAttachmentGet(RuntimeProviderAttachmentTarget),
     #[serde(rename = "runtime_provider.detach")]

@@ -25,6 +25,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
         Method::ServerReloadConfig(_)
             | Method::ServerReloadAgentManifests(_)
             | Method::RuntimeProviderAttach(_)
+            | Method::RuntimeProviderTakeover(_)
             | Method::RuntimeProviderDetach(_)
             | Method::RuntimeProviderExecute(_)
             | Method::NotificationShow(_)

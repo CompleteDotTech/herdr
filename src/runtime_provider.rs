@@ -556,6 +556,9 @@ pub(crate) enum ProviderCommand {
     /// Submit one owner-local terminal mutation. The worker acquires a
     /// short-lived controller lease on the first user action and serializes
     /// mutation sequences with the live checkpoint attachment.
+    TerminalTakeover {
+        binding: ProviderBinding,
+    },
     TerminalInput {
         binding: ProviderBinding,
         bytes: Vec<u8>,
@@ -595,9 +598,9 @@ impl ProviderCommand {
             Self::ReadCheckpoint { .. } => ProviderOperationKind::ReadCheckpoint,
             Self::Execution { .. } => ProviderOperationKind::Execution,
             Self::LookupExecution { .. } => ProviderOperationKind::LookupExecution,
-            Self::TerminalInput { .. } | Self::TerminalResize { .. } => {
-                ProviderOperationKind::TerminalControl
-            }
+            Self::TerminalTakeover { .. }
+            | Self::TerminalInput { .. }
+            | Self::TerminalResize { .. } => ProviderOperationKind::TerminalControl,
         }
     }
 
@@ -608,6 +611,7 @@ impl ProviderCommand {
             | Self::ReadTranscript { binding, .. }
             | Self::AttachCheckpoint { binding, .. }
             | Self::ReadCheckpoint { binding, .. }
+            | Self::TerminalTakeover { binding }
             | Self::TerminalInput { binding, .. }
             | Self::TerminalResize { binding, .. }
             | Self::LookupExecution {
@@ -669,6 +673,7 @@ impl ProviderCommand {
                 }
                 Ok(())
             }
+            Self::TerminalTakeover { .. } => Ok(()),
             Self::Execution { request, .. } => request
                 .canonical_bytes()
                 .map(|_| ())

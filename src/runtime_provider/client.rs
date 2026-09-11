@@ -91,6 +91,9 @@ impl CovenProviderClient {
             ProviderCommand::ReadCheckpoint { binding } => self
                 .read_checkpoint(binding, runtime_generation)
                 .map(|update| ProviderOperationResult::Checkpoint(std::sync::Arc::new(update))),
+            ProviderCommand::TerminalTakeover { binding } => self
+                .terminal_takeover(binding, runtime_generation)
+                .map(|reply| ProviderOperationResult::TerminalControl(std::sync::Arc::new(reply))),
             ProviderCommand::TerminalInput { binding, bytes } => self
                 .terminal_input(binding, bytes, runtime_generation)
                 .map(|reply| ProviderOperationResult::TerminalControl(std::sync::Arc::new(reply))),
@@ -342,6 +345,41 @@ impl CovenProviderClient {
             },
             runtime_generation,
         )
+    }
+
+    fn terminal_takeover(
+        &mut self,
+        binding: &ProviderBinding,
+        runtime_generation: u64,
+    ) -> Result<TerminalControlReply, ProviderFailure> {
+        self.validate_binding(binding, runtime_generation)?;
+        let identity = self.control_identity.clone().ok_or_else(|| {
+            ProviderFailure::new(
+                ProviderFailureKind::Unsupported,
+                "terminal control was not negotiated for this attachment",
+            )
+        })?;
+        self.ensure_health()?;
+        let reply = self.send_terminal_control(
+            identity,
+            TerminalControlAction::takeover(CONTROL_LEASE_DURATION_MS),
+        )?;
+        let TerminalControlOutcome::TakenOver {
+            lease_generation,
+            next_mutation_seq,
+        } = &reply.outcome
+        else {
+            return Err(ProviderFailure::new(
+                ProviderFailureKind::Rejected,
+                "Coven returned an unexpected terminal takeover response",
+            ));
+        };
+        self.control_lease = Some(ControlLease {
+            generation: *lease_generation,
+            next_mutation_seq: *next_mutation_seq,
+            last_renewed: std::time::Instant::now(),
+        });
+        Ok(reply)
     }
 
     fn terminal_resize(

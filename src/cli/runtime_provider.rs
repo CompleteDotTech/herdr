@@ -4,7 +4,7 @@ use crate::api::schema::{
     RuntimeProviderTarget,
 };
 
-const USAGE: &str = "usage: herdr runtime-provider <list|get PROVIDER|attach PROVIDER SESSION GENERATION [--workspace ID] [--label LABEL] [--focus]|attachment TERMINAL|detach TERMINAL>";
+const USAGE: &str = "usage: herdr runtime-provider <list|get PROVIDER|attach PROVIDER SESSION GENERATION [--workspace ID] [--label LABEL] [--focus]|attachment TERMINAL|takeover TERMINAL|detach TERMINAL>";
 
 pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     if matches!(args, [command] if matches!(command.as_str(), "help" | "--help" | "-h")) {
@@ -38,6 +38,11 @@ fn parse(args: &[String]) -> Option<Method> {
         ),
         [command, id] if command == "detach" && valid_id(id) => Some(
             Method::RuntimeProviderDetach(RuntimeProviderAttachmentTarget {
+                terminal_id: id.clone(),
+            }),
+        ),
+        [command, id] if command == "takeover" && valid_id(id) => Some(
+            Method::RuntimeProviderTakeover(RuntimeProviderAttachmentTarget {
                 terminal_id: id.clone(),
             }),
         ),
@@ -165,6 +170,10 @@ mod tests {
         assert!(matches!(
             parse(&args(&["detach", "t"])),
             Some(Method::RuntimeProviderDetach(_))
+        ));
+        assert!(matches!(
+            parse(&args(&["takeover", "t"])),
+            Some(Method::RuntimeProviderTakeover(_))
         ));
     }
 }

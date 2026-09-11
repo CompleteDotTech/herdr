@@ -939,6 +939,72 @@ impl App {
             ),
         }
     }
+
+    /// Explicitly replace the owner-local terminal controller for an existing
+    /// checkpoint attachment. Queue admission is immediate; the provider
+    /// worker performs the blocking Coven takeover and fences subsequent
+    /// mutations with the newly issued generation.
+    pub(super) fn handle_runtime_provider_takeover(
+        &mut self,
+        id: String,
+        target: RuntimeProviderAttachmentTarget,
+    ) -> String {
+        let terminal_id = self
+            .state
+            .terminals
+            .iter()
+            .find(|(key, terminal)| {
+                key.as_str() == target.terminal_id
+                    && terminal.external_binding.is_some()
+                    && self.terminal_runtimes.external(key).is_some()
+            })
+            .map(|(key, _)| key.clone());
+        let Some(terminal_id) = terminal_id else {
+            return encode_error(
+                id,
+                "attachment_not_found",
+                "provider attachment does not exist",
+            );
+        };
+        if self
+            .terminal_runtimes
+            .external_session(&terminal_id)
+            .is_none()
+        {
+            return encode_error(
+                id,
+                "control_unavailable",
+                "terminal control has not been negotiated for this attachment",
+            );
+        }
+        let Some(binding) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.external_binding.as_ref())
+            .cloned()
+        else {
+            return encode_error(
+                id,
+                "attachment_not_found",
+                "provider attachment does not exist",
+            );
+        };
+        let Some(runtime) = self.terminal_runtimes.external(&terminal_id).cloned() else {
+            return encode_error(id, "provider_unavailable", "provider worker is unavailable");
+        };
+        match runtime.submit(ProviderCommand::TerminalTakeover {
+            binding: binding.execution,
+        }) {
+            Ok(_) => encode_success(id, ResponseResult::Ok {}),
+            Err(error) => encode_error(
+                id,
+                "takeover_not_admitted",
+                format!("terminal takeover was not admitted: {error:?}"),
+            ),
+        }
+    }
+
     pub(super) fn handle_runtime_provider_detach(
         &mut self,
         id: String,

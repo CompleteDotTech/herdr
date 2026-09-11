@@ -393,6 +393,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::RuntimeProviderList(_) => "runtime_provider.list",
         Method::RuntimeProviderGet(_) => "runtime_provider.get",
         Method::RuntimeProviderAttach(_) => "runtime_provider.attach",
+        Method::RuntimeProviderTakeover(_) => "runtime_provider.takeover",
         Method::RuntimeProviderAttachmentGet(_) => "runtime_provider.attachment.get",
         Method::RuntimeProviderDetach(_) => "runtime_provider.detach",
         Method::RuntimeProviderExecute(_) => "runtime_provider.execute",
