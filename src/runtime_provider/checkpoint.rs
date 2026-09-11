@@ -219,7 +219,11 @@ fn attach_request(
     let mut request = TerminalCheckpointAttachRequest::new(
         binding.session_id.as_str(),
         fresh_attachment_id(attachment_id),
-    );
+    )
+    // Herdr's managed pane is an owner-local terminal attachment. Request the
+    // separate control capability, while still requiring an explicit lease
+    // acquisition before any input or resize is sent.
+    .with_control(true);
     if let Some(saved) = saved {
         saved.validate().map_err(projection_error)?;
         let stream = &saved.binding;

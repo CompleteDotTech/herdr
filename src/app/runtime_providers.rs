@@ -4,8 +4,8 @@ use super::App;
 use crate::{
     runtime_provider::{
         OwnerProviderSettings, ProviderCommand, ProviderConfig, ProviderConnection,
-        ProviderFailureKind, ProviderObservation, ProviderOperationResult, ProviderRuntime,
-        ProviderRuntimeHandle,
+        ProviderFailureKind, ProviderObservation, ProviderOperation, ProviderOperationResult,
+        ProviderRuntime, ProviderRuntimeHandle,
     },
     terminal::{backend::ExternalBinding, TerminalId},
 };
@@ -375,13 +375,36 @@ impl App {
             };
             // Drain notifications to keep the channel bounded; the latest
             // snapshot remains authoritative even if notifications were dropped.
-            runtime.try_drain_updates(8);
+            // The immutable snapshot intentionally contains only the latest
+            // operation. A terminal-control command can complete between a
+            // checkpoint read and this app-loop tick, replacing that latest
+            // value before the read ticket is reconciled. Consume the
+            // ticketed update first so observation polling cannot get stuck
+            // behind an unrelated control operation; retain the snapshot as
+            // the fallback when no matching update is available.
+            let updates = runtime.try_drain_updates(64);
             let snapshot = runtime.snapshot();
-            if let Some(operation) = snapshot
-                .last_operation
-                .as_ref()
-                .filter(|operation| Some(operation.ticket) == poll.pending)
-            {
+            let pending_operation = poll.pending.and_then(|ticket| {
+                updates
+                    .iter()
+                    .filter(|update| update.ticket == Some(ticket))
+                    .filter(|update| {
+                        !matches!(update.result, ProviderOperationResult::Pending { .. })
+                    })
+                    .last()
+                    .map(|update| ProviderOperation {
+                        ticket,
+                        kind: update.kind,
+                        result: update.result.clone(),
+                    })
+                    .or_else(|| {
+                        snapshot
+                            .last_operation
+                            .clone()
+                            .filter(|operation| operation.ticket == ticket)
+                    })
+            });
+            if let Some(operation) = pending_operation.as_ref() {
                 if !matches!(operation.result, ProviderOperationResult::Pending { .. }) {
                     poll.pending = None;
                     poll.next_read = now + READ_INTERVAL;

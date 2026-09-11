@@ -30,6 +30,7 @@ use coven_client::{
         RequestId,
     },
     source::{SourceCursor, SourceId, SourceIdentity, SourceReply},
+    terminal_control::TerminalControlReply,
 };
 
 pub(crate) use actor::{ProviderRuntime, ProviderRuntimeHandle};
@@ -436,6 +437,7 @@ pub(crate) enum ProviderOperationKind {
     ReadCheckpoint,
     Execution,
     LookupExecution,
+    TerminalControl,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,6 +481,7 @@ pub(crate) enum ProviderOperationResult {
     Checkpoint(Arc<ProviderCheckpointUpdate>),
     Execution(ExecutionOutcome),
     LookupExecution(ExecutionOutcome),
+    TerminalControl(Arc<TerminalControlReply>),
     Failure(ProviderFailure),
     Detached,
     Shutdown,
@@ -550,6 +553,20 @@ pub(crate) enum ProviderCommand {
     ReadCheckpoint {
         binding: ProviderBinding,
     },
+    /// Submit one owner-local terminal mutation. The worker acquires a
+    /// short-lived controller lease on the first user action and serializes
+    /// mutation sequences with the live checkpoint attachment.
+    TerminalInput {
+        binding: ProviderBinding,
+        bytes: Vec<u8>,
+    },
+    TerminalResize {
+        binding: ProviderBinding,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    },
     #[allow(
         dead_code,
         reason = "provider action endpoint remains available for the typed worker contract and test harness"
@@ -578,6 +595,9 @@ impl ProviderCommand {
             Self::ReadCheckpoint { .. } => ProviderOperationKind::ReadCheckpoint,
             Self::Execution { .. } => ProviderOperationKind::Execution,
             Self::LookupExecution { .. } => ProviderOperationKind::LookupExecution,
+            Self::TerminalInput { .. } | Self::TerminalResize { .. } => {
+                ProviderOperationKind::TerminalControl
+            }
         }
     }
 
@@ -588,6 +608,8 @@ impl ProviderCommand {
             | Self::ReadTranscript { binding, .. }
             | Self::AttachCheckpoint { binding, .. }
             | Self::ReadCheckpoint { binding, .. }
+            | Self::TerminalInput { binding, .. }
+            | Self::TerminalResize { binding, .. }
             | Self::LookupExecution {
                 binding: Some(binding),
                 ..
@@ -635,6 +657,18 @@ impl ProviderCommand {
                 Ok(())
             }
             Self::ReadCheckpoint { .. } => Ok(()),
+            Self::TerminalInput { bytes, .. } => {
+                if bytes.len() > coven_client::terminal_control::MAX_TERMINAL_CONTROL_INPUT_BYTES {
+                    return Err(SubmitError::Rejected);
+                }
+                Ok(())
+            }
+            Self::TerminalResize { rows, cols, .. } => {
+                if *rows == 0 || *cols == 0 {
+                    return Err(SubmitError::Rejected);
+                }
+                Ok(())
+            }
             Self::Execution { request, .. } => request
                 .canonical_bytes()
                 .map(|_| ())

@@ -261,6 +261,39 @@ fn stable_external_snapshot_scrollbar_gutter(
     (inner_rect, Some(gutter))
 }
 
+fn submit_external_resize(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_id: &crate::terminal::TerminalId,
+    inner_rect: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    let Some(binding) = app
+        .terminals
+        .get(terminal_id)
+        .and_then(|terminal| terminal.external_binding.as_ref())
+        .map(|binding| binding.execution.clone())
+    else {
+        return;
+    };
+    let Some(runtime) = terminal_runtimes.external(terminal_id) else {
+        return;
+    };
+    // The provider worker must have completed the typed checkpoint attach
+    // before a resize can be admitted; otherwise a render tick could enqueue
+    // a control command ahead of its negotiated identity.
+    if terminal_runtimes.external_session(terminal_id).is_none() {
+        return;
+    }
+    let _ = runtime.submit_external_resize(
+        binding,
+        inner_rect.height,
+        inner_rect.width,
+        u16::try_from(cell_size.width_px).unwrap_or(u16::MAX),
+        u16::try_from(cell_size.height_px).unwrap_or(u16::MAX),
+    );
+}
+
 /// Resize every visible runtime in a tab to the geometry it would receive if the tab were selected.
 pub(super) fn resize_tab_panes(
     app: &AppState,
@@ -408,6 +441,9 @@ pub(super) fn compute_pane_infos_for_tab_with_external_snapshots(
                         stable_external_scrollbar_gutter(session, pane_inner, app.pane_scrollbars);
                 }
             }
+            if resize_panes && !app.direct_attach_resize_locks.contains(terminal_id) {
+                submit_external_resize(app, terminal_runtimes, terminal_id, inner_rect, cell_size);
+            }
         }
         return vec![PaneInfo {
             id: focused_id,
@@ -459,6 +495,9 @@ pub(super) fn compute_pane_infos_for_tab_with_external_snapshots(
                     (inner_rect, scrollbar_rect) =
                         stable_external_scrollbar_gutter(session, pane_inner, app.pane_scrollbars);
                 }
+            }
+            if resize_panes && !app.direct_attach_resize_locks.contains(terminal_id) {
+                submit_external_resize(app, terminal_runtimes, terminal_id, inner_rect, cell_size);
             }
         }
 

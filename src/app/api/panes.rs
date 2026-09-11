@@ -23,8 +23,9 @@ use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
-    normalize_metadata_ttl, normalize_reported_agent_label, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    detect_state_from_api, encode_api_keys, encode_external_api_input, normalize_metadata_source,
+    normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
+    MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
@@ -2121,6 +2122,71 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    fn external_terminal_id_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> Option<crate::terminal::TerminalId> {
+        self.state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .filter(|terminal_id| {
+                self.state
+                    .terminals
+                    .get(*terminal_id)
+                    .is_some_and(|terminal| terminal.external_binding.is_some())
+            })
+            .cloned()
+    }
+
+    fn external_input_bytes(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        text: &str,
+        keys: &[String],
+    ) -> Result<Vec<u8>, String> {
+        let terminal_id = self
+            .external_terminal_id_for_pane(ws_idx, pane_id)
+            .ok_or_else(|| "external terminal attachment is unavailable".to_owned())?;
+        let session = self
+            .terminal_runtimes
+            .external_session(&terminal_id)
+            .ok_or_else(|| "external terminal model is unavailable".to_owned())?;
+        encode_external_api_input(session, text, keys)
+    }
+
+    fn submit_external_terminal_input(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let terminal_id = self
+            .external_terminal_id_for_pane(ws_idx, pane_id)
+            .ok_or_else(|| "external terminal attachment is unavailable".to_owned())?;
+        let binding = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.external_binding.as_ref())
+            .map(|binding| binding.execution.clone())
+            .ok_or_else(|| "external terminal binding is unavailable".to_owned())?;
+        let runtime = self
+            .terminal_runtimes
+            .external(&terminal_id)
+            .cloned()
+            .ok_or_else(|| "external terminal provider is unavailable".to_owned())?;
+        runtime
+            .submit(crate::runtime_provider::ProviderCommand::TerminalInput { binding, bytes })
+            .map(|_| ())
+            .map_err(|error| format!("external terminal input was not admitted: {error:?}"))
+    }
+
     pub(super) fn handle_pane_send_text(
         &mut self,
         id: String,
@@ -2129,6 +2195,23 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if self
+            .external_terminal_id_for_pane(ws_idx, pane_id)
+            .is_some_and(|terminal_id| {
+                self.terminal_runtimes
+                    .external_session(&terminal_id)
+                    .is_some()
+            })
+        {
+            let bytes = match self.external_input_bytes(ws_idx, pane_id, &params.text, &[]) {
+                Ok(bytes) => bytes,
+                Err(message) => return encode_error(id, "pane_send_failed", message),
+            };
+            return match self.submit_external_terminal_input(ws_idx, pane_id, bytes) {
+                Ok(()) => encode_success(id, ResponseResult::Ok {}),
+                Err(message) => encode_error(id, "pane_send_failed", message),
+            };
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2147,6 +2230,26 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if self
+            .external_terminal_id_for_pane(ws_idx, pane_id)
+            .is_some_and(|terminal_id| {
+                self.terminal_runtimes
+                    .external_session(&terminal_id)
+                    .is_some()
+            })
+        {
+            let bytes = match self.external_input_bytes(ws_idx, pane_id, &params.text, &params.keys)
+            {
+                Ok(bytes) => bytes,
+                Err(key) => {
+                    return encode_error(id, "invalid_key", format!("unsupported key {key}"))
+                }
+            };
+            return match self.submit_external_terminal_input(ws_idx, pane_id, bytes) {
+                Ok(()) => encode_success(id, ResponseResult::Ok {}),
+                Err(message) => encode_error(id, "pane_send_failed", message),
+            };
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2245,6 +2348,25 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if self
+            .external_terminal_id_for_pane(ws_idx, pane_id)
+            .is_some_and(|terminal_id| {
+                self.terminal_runtimes
+                    .external_session(&terminal_id)
+                    .is_some()
+            })
+        {
+            let bytes = match self.external_input_bytes(ws_idx, pane_id, "", &params.keys) {
+                Ok(bytes) => bytes,
+                Err(key) => {
+                    return encode_error(id, "invalid_key", format!("unsupported key {key}"))
+                }
+            };
+            return match self.submit_external_terminal_input(ws_idx, pane_id, bytes) {
+                Ok(()) => encode_success(id, ResponseResult::Ok {}),
+                Err(message) => encode_error(id, "pane_send_failed", message),
+            };
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };

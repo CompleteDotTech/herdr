@@ -1,6 +1,11 @@
 use coven_client::{
     execution::{ExecutionRequest, ExecutionTarget, RequestId},
     source::{SourceCursor, SourceRead, SourceReply, MAX_EVENTS},
+    terminal_control::{
+        TerminalControlAction, TerminalControlClient, TerminalControlClientError,
+        TerminalControlIdentity, TerminalControlOutcome, TerminalControlReply,
+        TerminalMutationStatus,
+    },
     ClientError, DaemonClient, DaemonEndpoint,
 };
 
@@ -13,7 +18,22 @@ pub(super) struct CovenProviderClient {
     config: super::ProviderConfig,
     daemon: Option<DaemonClient>,
     checkpoint_connection: Option<super::checkpoint::CheckpointConnection>,
+    control_identity: Option<TerminalControlIdentity>,
+    control_lease: Option<ControlLease>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct ControlLease {
+    generation: u64,
+    next_mutation_seq: u64,
+    last_renewed: std::time::Instant,
+}
+
+// The daemon's default owner controller intentionally uses a 30-second cap;
+// keep the provider's automatic first lease within that configured bound.
+const CONTROL_LEASE_DURATION_MS: u64 = 30_000;
+const CONTROL_LEASE_RENEW_AFTER: std::time::Duration =
+    std::time::Duration::from_millis(CONTROL_LEASE_DURATION_MS / 2);
 
 impl CovenProviderClient {
     pub(super) fn new(config: super::ProviderConfig) -> Self {
@@ -21,12 +41,16 @@ impl CovenProviderClient {
             config,
             daemon: None,
             checkpoint_connection: None,
+            control_identity: None,
+            control_lease: None,
         }
     }
 
     pub(super) fn reset(&mut self) {
         self.daemon = None;
         self.checkpoint_connection = None;
+        self.control_identity = None;
+        self.control_lease = None;
     }
 
     pub(super) fn execute(
@@ -67,6 +91,25 @@ impl CovenProviderClient {
             ProviderCommand::ReadCheckpoint { binding } => self
                 .read_checkpoint(binding, runtime_generation)
                 .map(|update| ProviderOperationResult::Checkpoint(std::sync::Arc::new(update))),
+            ProviderCommand::TerminalInput { binding, bytes } => self
+                .terminal_input(binding, bytes, runtime_generation)
+                .map(|reply| ProviderOperationResult::TerminalControl(std::sync::Arc::new(reply))),
+            ProviderCommand::TerminalResize {
+                binding,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            } => self
+                .terminal_resize(
+                    binding,
+                    *rows,
+                    *cols,
+                    *pixel_width,
+                    *pixel_height,
+                    runtime_generation,
+                )
+                .map(|reply| ProviderOperationResult::TerminalControl(std::sync::Arc::new(reply))),
             ProviderCommand::Execution { binding, request } => self
                 .execution(binding.as_ref(), request, runtime_generation)
                 .map(ProviderOperationResult::Execution),
@@ -274,8 +317,233 @@ impl CovenProviderClient {
             checkpoint,
         )?;
         let attached = connection.attachment();
+        let control_identity = attached
+            .response
+            .control_identity()
+            .map_err(map_client_error)?;
         self.checkpoint_connection = Some(connection);
+        self.control_identity = Some(control_identity);
+        self.control_lease = None;
         Ok(attached)
+    }
+
+    fn terminal_input(
+        &mut self,
+        binding: &ProviderBinding,
+        bytes: &[u8],
+        runtime_generation: u64,
+    ) -> Result<TerminalControlReply, ProviderFailure> {
+        self.terminal_mutation(
+            binding,
+            TerminalControlAction::Input {
+                lease_generation: 0,
+                mutation_seq: 0,
+                bytes: bytes.to_vec(),
+            },
+            runtime_generation,
+        )
+    }
+
+    fn terminal_resize(
+        &mut self,
+        binding: &ProviderBinding,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+        runtime_generation: u64,
+    ) -> Result<TerminalControlReply, ProviderFailure> {
+        self.terminal_mutation(
+            binding,
+            TerminalControlAction::Resize {
+                lease_generation: 0,
+                mutation_seq: 0,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            },
+            runtime_generation,
+        )
+    }
+
+    /// Acquire a lease only as part of a user-admitted mutation. The worker is
+    /// the sole owner of lease and mutation sequencing, so concurrent UI
+    /// requests cannot race or reuse a sequence. Unknown transport outcomes
+    /// are returned without retrying or replaying the bytes.
+    fn terminal_mutation(
+        &mut self,
+        binding: &ProviderBinding,
+        action: TerminalControlAction,
+        runtime_generation: u64,
+    ) -> Result<TerminalControlReply, ProviderFailure> {
+        self.validate_binding(binding, runtime_generation)?;
+        if !matches!(
+            action,
+            TerminalControlAction::Input { .. } | TerminalControlAction::Resize { .. }
+        ) {
+            return Err(ProviderFailure::new(
+                ProviderFailureKind::Rejected,
+                "unsupported terminal mutation",
+            ));
+        }
+        let identity = self.control_identity.clone().ok_or_else(|| {
+            ProviderFailure::new(
+                ProviderFailureKind::Unsupported,
+                "terminal control was not negotiated for this attachment",
+            )
+        })?;
+        self.ensure_health()?;
+        if self.control_lease.is_none() {
+            let acquired = self.send_terminal_control(
+                identity.clone(),
+                TerminalControlAction::acquire(CONTROL_LEASE_DURATION_MS),
+            )?;
+            let TerminalControlOutcome::Acquired {
+                lease_generation,
+                next_mutation_seq,
+            } = acquired.outcome
+            else {
+                return Err(ProviderFailure::new(
+                    ProviderFailureKind::Rejected,
+                    "Coven returned an unexpected terminal lease response",
+                ));
+            };
+            self.control_lease = Some(ControlLease {
+                generation: lease_generation,
+                next_mutation_seq,
+                last_renewed: std::time::Instant::now(),
+            });
+        }
+        let mut lease = self.control_lease.expect("lease initialized above");
+        if lease.last_renewed.elapsed() >= CONTROL_LEASE_RENEW_AFTER {
+            let renewed = self.send_terminal_control(
+                identity.clone(),
+                TerminalControlAction::renew(lease.generation, CONTROL_LEASE_DURATION_MS),
+            );
+            let TerminalControlOutcome::Renewed {
+                lease_generation,
+                next_mutation_seq,
+            } = (match renewed {
+                Ok(reply) => reply.outcome,
+                Err(error) => {
+                    // The lease may have expired while the worker was idle.
+                    // Forget it before returning so the next explicit user
+                    // action can attempt a fresh acquire instead of reusing a
+                    // known-stale generation.
+                    self.control_lease = None;
+                    return Err(error);
+                }
+            })
+            else {
+                self.control_lease = None;
+                return Err(ProviderFailure::new(
+                    ProviderFailureKind::Rejected,
+                    "Coven returned an unexpected terminal lease renewal response",
+                ));
+            };
+            lease = ControlLease {
+                generation: lease_generation,
+                next_mutation_seq,
+                last_renewed: std::time::Instant::now(),
+            };
+            self.control_lease = Some(lease);
+        }
+        let sequence = lease.next_mutation_seq;
+        let action = match action {
+            TerminalControlAction::Input { bytes, .. } => {
+                TerminalControlAction::input(lease.generation, sequence, bytes)
+            }
+            TerminalControlAction::Resize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+                ..
+            } => TerminalControlAction::resize(
+                lease.generation,
+                sequence,
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            ),
+            _ => unreachable!("terminal mutation action validated above"),
+        };
+        let reply = self.send_terminal_control(identity, action)?;
+        let pending = matches!(
+            &reply.outcome,
+            TerminalControlOutcome::Mutation {
+                status: TerminalMutationStatus::Pending,
+                ..
+            }
+        );
+        if let TerminalControlOutcome::Mutation {
+            mutation_seq,
+            status,
+            ..
+        } = &reply.outcome
+        {
+            if *mutation_seq == sequence && !matches!(status, TerminalMutationStatus::Rejected) {
+                self.control_lease = Some(ControlLease {
+                    generation: lease.generation,
+                    next_mutation_seq: sequence.saturating_add(1),
+                    last_renewed: lease.last_renewed,
+                });
+            }
+            if matches!(status, TerminalMutationStatus::Stopped) {
+                self.control_lease = None;
+            }
+        }
+        // A successful enqueue is not proof that the PTY observed the bytes.
+        // Poll the same idempotent receipt for a short bounded interval so a
+        // user-facing call normally reflects writer completion, while never
+        // replaying the mutation or converting an uncertain transport result
+        // into another input request.
+        if pending {
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let polled = self.send_terminal_control(
+                    self.control_identity
+                        .clone()
+                        .expect("control identity retained while polling"),
+                    TerminalControlAction::poll(sequence),
+                );
+                let Ok(polled) = polled else {
+                    break;
+                };
+                if !matches!(
+                    polled.outcome,
+                    TerminalControlOutcome::Polled {
+                        status: TerminalMutationStatus::Pending,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        }
+        Ok(reply)
+    }
+
+    fn send_terminal_control(
+        &mut self,
+        identity: TerminalControlIdentity,
+        action: TerminalControlAction,
+    ) -> Result<TerminalControlReply, ProviderFailure> {
+        let request = coven_client::terminal_control::TerminalControlRequest::new(identity, action);
+        let result = self.daemon().and_then(|daemon| {
+            daemon
+                .terminal_control(&request)
+                .map_err(map_terminal_control_error)
+        });
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(failure) => {
+                self.reset_if_disconnected(&failure);
+                Err(failure)
+            }
+        }
     }
 
     fn read_checkpoint(
@@ -469,6 +737,20 @@ pub(super) fn map_client_error(error: ClientError) -> ProviderFailure {
         ClientError::Daemon { .. } | ClientError::HttpStatus(_) => ProviderFailureKind::Failed,
     };
     ProviderFailure::new(kind, safe_client_error_message(&error))
+}
+
+fn map_terminal_control_error(error: TerminalControlClientError) -> ProviderFailure {
+    match error {
+        TerminalControlClientError::Transport(error) => map_client_error(error),
+        TerminalControlClientError::InvalidRequest(_)
+        | TerminalControlClientError::InvalidResponse(_)
+        | TerminalControlClientError::Json(_)
+        | TerminalControlClientError::RequestTooLarge { .. }
+        | TerminalControlClientError::ResponseTooLarge { .. } => ProviderFailure::new(
+            ProviderFailureKind::Rejected,
+            "Coven terminal control response or request was invalid",
+        ),
+    }
 }
 
 /// Keep provider diagnostics useful without forwarding owner-local paths,

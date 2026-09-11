@@ -68,6 +68,7 @@ struct SharedState {
     runtime_generation: AtomicU64,
     detached: AtomicBool,
     stopped: AtomicBool,
+    last_external_resize: Mutex<Option<(u16, u16, u16, u16)>>,
 }
 
 /// Factory for the provider actor.  The actor owns the only mutable
@@ -146,6 +147,7 @@ impl ProviderRuntime {
             runtime_generation: AtomicU64::new(runtime_generation),
             detached: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            last_external_resize: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -232,6 +234,44 @@ impl ProviderRuntimeHandle {
                 Err(SubmitError::Disconnected)
             }
         }
+    }
+
+    /// Submit a remote resize only when geometry changed. Rendering can call
+    /// this once per frame; the shared cache keeps a slow provider queue from
+    /// filling with duplicate dimensions.
+    pub(crate) fn submit_external_resize(
+        &self,
+        binding: super::ProviderBinding,
+        rows: u16,
+        cols: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> Result<bool, SubmitError> {
+        let geometry = (rows, cols, pixel_width, pixel_height);
+        {
+            let cached = self
+                .shared
+                .last_external_resize
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *cached == Some(geometry) {
+                return Ok(false);
+            }
+        }
+        self.submit(ProviderCommand::TerminalResize {
+            binding,
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        })?;
+        let mut cached = self
+            .shared
+            .last_external_resize
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cached = Some(geometry);
+        Ok(true)
     }
 
     fn fence_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -508,7 +548,20 @@ impl ProviderRuntimeHandle {
                     current.activity = map_activity_name(status);
                 }
             }
+            ProviderOperationResult::TerminalControl(_) => {
+                current.connection = ProviderConnection::Connected;
+            }
             ProviderOperationResult::Failure(failure) => {
+                if kind == super::ProviderOperationKind::TerminalControl {
+                    // A rejected or failed resize must not poison the
+                    // geometry de-duplication cache. The next render may need
+                    // to retry after a lease/daemon/attachment transition.
+                    *self
+                        .shared
+                        .last_external_resize
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                }
                 current.connection = match failure.kind {
                     ProviderFailureKind::Disconnected | ProviderFailureKind::IdentityMismatch => {
                         ProviderConnection::Disconnected
