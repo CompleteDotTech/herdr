@@ -922,6 +922,30 @@ command = ["sh", "-c", "printf '%s:%s\\n' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_E
         1,
         "handoff import should invoke the startup hook exactly once: {output:?}"
     );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let startup_log = loop {
+        let logs = request(
+            &api_socket,
+            serde_json::json!({
+                "id":"test:plugin:logs",
+                "method":"plugin.log.list",
+                "params":{"plugin_id":"test.live-handoff-startup","limit":10}
+            }),
+        );
+        assert_ok(logs.clone());
+        if let Some(log) = logs["result"]["logs"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["event"] == "startup"))
+        {
+            if log["status"] != "running" {
+                break log.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "startup hook did not settle");
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(startup_log["status"], "succeeded");
+    assert_eq!(startup_log["exit_code"], 0);
     assert_eq!(
         listed_plugin_ids(&api_socket),
         ["test.live-handoff-startup"]
