@@ -24,11 +24,13 @@ impl Fixture {
         // nextest launches unit tests in separate processes. Serialize these
         // Git worktree fixtures because their process-visibility assertions
         // intentionally inspect process-wide state.
-        let test_lock_path = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .unwrap_or_else(std::env::temp_dir)
+        #[cfg(unix)]
+        let test_lock_path = std::env::var_os("HERDR_TEST_LOCK_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("herdr-cleanup-fixtures-v1.lock");
+        #[cfg(not(unix))]
+        let test_lock_path = std::env::temp_dir().join("herdr-cleanup-fixtures-v1.lock");
         let test_lock =
             Lease::exclusive_wait(&test_lock_path, std::time::Duration::from_secs(120)).unwrap();
         let dir = std::env::temp_dir().join(format!(
