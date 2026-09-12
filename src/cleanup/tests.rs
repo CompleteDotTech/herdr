@@ -215,6 +215,24 @@ fn cleanup_ownership_blocks_removal_and_admission_while_exclusive() {
 }
 
 #[test]
+fn cleanup_admission_waits_for_owner_metadata_publication() {
+    let f = Fixture::new();
+    let path = f.worktree("metadata-lock");
+    let root = f.dir.join("ownership");
+    let session = f.dir.join("session");
+    let lock = Lease::exclusive(&root.join("owners.lock")).unwrap();
+    let admission = std::thread::spawn({
+        let root = root.clone();
+        let session = session.clone();
+        let path = path.clone();
+        move || Admission::at(&root, &session, &path)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(lock);
+    drop(admission.join().unwrap().unwrap());
+}
+
+#[test]
 fn cleanup_rechecks_candidate_commit_and_branch_checkout() {
     let f = Fixture::new();
     let path = f.worktree("changed");

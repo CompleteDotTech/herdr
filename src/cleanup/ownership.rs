@@ -52,7 +52,8 @@ impl Admission {
         }
         // Persist intent before spawn. A crash cannot turn a resumable session
         // into an unowned candidate. The next authoritative session sync clears it.
-        let _lock = Lease::exclusive(&root.join("owners.lock"))?;
+        let _lock =
+            Lease::exclusive_wait(&root.join("owners.lock"), std::time::Duration::from_secs(2))?;
         let file = root.join("owners").join(format!("{}.json", key(session)));
         let mut owner: Owner = store::read(&file)?;
         owner.session = session.to_path_buf();

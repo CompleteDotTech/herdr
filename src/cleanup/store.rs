@@ -29,6 +29,24 @@ impl Lease {
     pub fn exclusive(path: &Path) -> Result<Self> {
         Self::open(path, false)
     }
+    /// Metadata publication is short-lived. Wait briefly rather than rejecting
+    /// a newly launched runtime solely because another runtime is updating its
+    /// ownership record. Path leases remain nonblocking safety barriers.
+    pub fn exclusive_wait(path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match Self::exclusive(path) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     pub fn shared(path: &Path) -> Result<Self> {
         Self::open(path, true)
     }
