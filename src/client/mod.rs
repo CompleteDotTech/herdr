@@ -520,11 +520,13 @@ async fn run_client_loop(
             endpoint::ClientEndpointId::Local,
             1,
             max_frame_size,
+            handshake.surface_codec,
         )?;
         let negotiation = endpoint::EndpointNegotiation::new(
             handshake.endpoint_methods.unwrap_or_default(),
             handshake.endpoint_capabilities.unwrap_or_default(),
-        );
+        )
+        .with_surface_codec(handshake.surface_codec);
         let mut registry = endpoint::EndpointRegistry::new(transport, 1, negotiation);
         if state.shell.is_some() {
             registry.send(&ClientMessage::ClientShellFocus { focused: true });
@@ -1158,6 +1160,7 @@ async fn run_client_loop(
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
                     let reader_quit = writer.stop_handle();
+                    let surface_codec = negotiation.surface_codec;
                     write_stream.insert(
                         endpoint_id.clone(),
                         writer,
@@ -1177,6 +1180,7 @@ async fn run_client_loop(
                             MAX_GRAPHICS_FRAME_SIZE,
                             endpoint_id,
                             generation,
+                            surface_codec,
                         );
                     });
                 }

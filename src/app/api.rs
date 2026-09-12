@@ -168,6 +168,14 @@ impl App {
 
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            // A local PTY notification is never lifecycle authority for Coven.
+            if self
+                .find_pane(*pane_id)
+                .and_then(|(_, pane)| self.state.terminals.get(&pane.attached_terminal_id))
+                .is_some_and(|terminal| terminal.external_binding.is_some())
+            {
+                return Vec::new();
+            }
             if self
                 .state
                 .popup_pane
@@ -548,6 +556,10 @@ impl App {
             return false;
         };
 
+        if terminal.external_binding.is_some() {
+            return false;
+        }
+
         let cwd = terminal.cwd.clone();
         let (rows, cols) = self
             .terminal_runtimes
@@ -892,6 +904,29 @@ impl App {
         };
 
         let response = match request.method {
+            Method::RuntimeProviderList(_) => return self.handle_runtime_provider_list(request.id),
+            Method::RuntimeProviderGet(params) => {
+                return self.handle_runtime_provider_get(request.id, params);
+            }
+            Method::RuntimeProviderAttach(params) => {
+                return self.handle_runtime_provider_attach(request.id, params);
+            }
+            Method::RuntimeProviderTakeover(params) => {
+                return self.handle_runtime_provider_takeover(request.id, params);
+            }
+            Method::RuntimeProviderAttachmentGet(params) => {
+                return self.handle_runtime_provider_attachment_get(request.id, params);
+            }
+            Method::RuntimeProviderDetach(params) => {
+                return self.handle_runtime_provider_detach(request.id, params);
+            }
+            Method::RuntimeProviderExecute(params) => {
+                return self.handle_runtime_provider_execute(request.id, params);
+            }
+            Method::RuntimeProviderOperationGet(params) => {
+                return self.handle_runtime_provider_operation_get(request.id, params);
+            }
+
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
                 SuccessResponse {
@@ -1011,7 +1046,7 @@ impl App {
                 return self.handle_workspace_create(request.id, params);
             }
             Method::WorkspaceFocus(target) => {
-                return self.handle_workspace_focus(request.id, target)
+                return self.handle_workspace_focus(request.id, target);
             }
             Method::WorkspaceRename(params) => {
                 return self.handle_workspace_rename(request.id, params);
@@ -1026,8 +1061,9 @@ impl App {
                 return self.handle_workspace_report_metadata(request.id, params);
             }
             Method::WorkspaceClose(target) => {
-                return self.handle_workspace_close(request.id, target)
+                return self.handle_workspace_close(request.id, target);
             }
+            Method::WorktreeCleanup(action) => return self.handle_cleanup_api(request.id, action),
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {
                 let _ = params;
@@ -1059,7 +1095,7 @@ impl App {
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentViewSet(params) => return self.handle_agent_view_set(request.id, params),
             Method::AgentViewClear(params) => {
-                return self.handle_agent_view_clear(request.id, params)
+                return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentPrompt(_) => {
@@ -1079,7 +1115,7 @@ impl App {
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSendKeys(params) => {
-                return self.handle_agent_send_keys(request.id, params)
+                return self.handle_agent_send_keys(request.id, params);
             }
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneSwap(params) => return self.handle_pane_swap(request.id, params),
@@ -1168,7 +1204,7 @@ impl App {
             }
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
-                return self.handle_pane_send_input(request.id, params)
+                return self.handle_pane_send_input(request.id, params);
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PopupClose(_) => {

@@ -120,6 +120,7 @@ fn set_handshake_recv_timeout(
 #[derive(Debug)]
 pub(super) struct HandshakeResult {
     pub(super) encoding: RenderEncoding,
+    pub(super) surface_codec: protocol::surface::SurfaceCodec,
     pub(super) endpoint_methods: Option<Vec<String>>,
     pub(super) endpoint_capabilities: Option<Vec<String>>,
 }
@@ -143,7 +144,8 @@ pub(crate) fn probe_endpoint_negotiation(
     Ok(super::endpoint::EndpointNegotiation::new(
         handshake.endpoint_methods.unwrap_or_default(),
         handshake.endpoint_capabilities.unwrap_or_default(),
-    ))
+    )
+    .with_surface_codec(handshake.surface_codec))
 }
 
 /// Performs the client→server handshake.
@@ -183,7 +185,10 @@ pub(super) fn do_handshake(
             mouse_capture,
             surface_active,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
-            surface_codecs: vec![SURFACE_CODEC_V1.into()],
+            surface_codecs: vec![
+                protocol::surface::SURFACE_CODEC_V2.into(),
+                SURFACE_CODEC_V1.into(),
+            ],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
         };
@@ -251,7 +256,7 @@ pub(super) fn do_handshake(
         }
         if welcome.generation != ENDPOINT_PROTOCOL_GENERATION
             || welcome.snapshot_codec != SNAPSHOT_CODEC_V1
-            || welcome.surface_codec != SURFACE_CODEC_V1
+            || protocol::surface::SurfaceCodec::from_name(&welcome.surface_codec).is_none()
             || welcome.input_codec != INPUT_CODEC_V1
             || welcome.blob_codec != BLOB_CODEC_V1
         {
@@ -267,6 +272,11 @@ pub(super) fn do_handshake(
         );
         return Ok(HandshakeResult {
             encoding: RenderEncoding::SemanticFrame,
+            surface_codec: protocol::surface::SurfaceCodec::from_name(&welcome.surface_codec)
+                .ok_or_else(|| ClientError::HandshakeRejected {
+                    version: welcome.generation,
+                    error: "server selected an unsupported surface codec".into(),
+                })?,
             endpoint_methods: Some(welcome.methods),
             endpoint_capabilities: Some(welcome.capabilities),
         });
@@ -284,6 +294,7 @@ pub(super) fn do_handshake(
             info!(version, ?encoding, "handshake succeeded");
             Ok(HandshakeResult {
                 encoding,
+                surface_codec: protocol::surface::SurfaceCodec::V1,
                 endpoint_methods: None,
                 endpoint_capabilities: None,
             })

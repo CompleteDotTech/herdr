@@ -384,12 +384,21 @@ fn handle_request(
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
+        Method::WorktreeCleanup(_) => "worktree.cleanup",
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
+        Method::RuntimeProviderList(_) => "runtime_provider.list",
+        Method::RuntimeProviderGet(_) => "runtime_provider.get",
+        Method::RuntimeProviderAttach(_) => "runtime_provider.attach",
+        Method::RuntimeProviderTakeover(_) => "runtime_provider.takeover",
+        Method::RuntimeProviderAttachmentGet(_) => "runtime_provider.attachment.get",
+        Method::RuntimeProviderDetach(_) => "runtime_provider.detach",
+        Method::RuntimeProviderExecute(_) => "runtime_provider.execute",
+        Method::RuntimeProviderOperationGet(_) => "runtime_provider.operation.get",
         Method::NotificationShow(_) => "notification.show",
         Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
         Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",

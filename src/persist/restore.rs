@@ -102,6 +102,11 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
+    if snapshot.has_external_bindings() {
+        return Err(std::io::Error::other(
+            "live handoff of external terminals is unsupported",
+        ));
+    }
     restore_with_imports_strict(
         snapshot,
         None,
@@ -267,6 +272,10 @@ fn restore_with_imports_and_failures(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
+    if let Err(reason) = snapshot.validate_external_bindings() {
+        error!(%reason, "refusing invalid external session snapshot");
+        return ((Vec::new(), HashMap::new(), HashMap::new()), 1);
+    }
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
@@ -402,9 +411,22 @@ fn restore_workspace(
         return (None, failed_imports);
     }
 
-    let worktree_space = restored_worktree_space_membership(snap.worktree_space.clone());
-    let (cached_git_space, cached_auto_label, cached_git_status_key) =
-        crate::workspace::discover_workspace_git_identity(&snap.identity_cwd);
+    let external_only = snapshot_is_external_only(snap);
+    let worktree_space = if external_only {
+        None
+    } else {
+        restored_worktree_space_membership(snap.worktree_space.clone())
+    };
+    let (cached_git_space, cached_auto_label, cached_git_status_key) = if external_only {
+        (None, "Coven".to_owned(), snap.identity_cwd.clone())
+    } else {
+        crate::workspace::discover_workspace_git_identity(&snap.identity_cwd)
+    };
+    let cached_git_branch = if external_only {
+        None
+    } else {
+        crate::workspace::git_branch(&snap.identity_cwd)
+    };
 
     (
         Some(Workspace {
@@ -414,7 +436,7 @@ fn restore_workspace(
             cached_identity_cwd: snap.identity_cwd.clone(),
             cached_auto_label,
             cached_git_status_key,
-            cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
+            cached_git_branch,
             cached_git_ahead_behind: None,
             cached_git_space,
             worktree_space,
@@ -431,6 +453,39 @@ fn restore_workspace(
         .map(|workspace| (workspace, terminals, terminal_runtimes)),
         failed_imports,
     )
+}
+
+/// Return whether a saved workspace is an external-only workspace whose local
+/// identity caches should be replaced with the neutral external defaults.
+///
+/// A missing pane entry is treated as native/unknown because restore will
+/// create a native pane for that layout node. A nonempty local Git identity or
+/// worktree membership is retained as evidence that a native workspace may
+/// have kept only an external pane after a move.
+fn snapshot_is_external_only(snap: &WorkspaceSnapshot) -> bool {
+    let mut has_external = false;
+    let mut has_native_or_unknown = false;
+    for tab in &snap.tabs {
+        let mut pane_ids = Vec::new();
+        collect_layout_snapshot_pane_ids(&tab.layout, &mut pane_ids);
+        for pane_id in pane_ids {
+            match tab
+                .panes
+                .get(&pane_id)
+                .and_then(|pane| pane.external_binding.as_ref())
+            {
+                Some(_) => has_external = true,
+                None => has_native_or_unknown = true,
+            }
+        }
+    }
+
+    let has_local_identity = snap.worktree_space.as_ref().is_some_and(|space| {
+        space.checkout_path.exists()
+            && crate::workspace::git_space_metadata(&space.checkout_path)
+                .is_some_and(|current| current.key == space.key)
+    });
+    has_external && !has_native_or_unknown && !has_local_identity
 }
 
 fn restored_worktree_space_membership(
@@ -469,6 +524,22 @@ fn restore_tab(
     for id in &pane_ids {
         let old_id = reverse_id_map.get(id);
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
+        // Restore external identity before any local cwd checks or native resume planning.
+        if let Some(binding) = saved_pane.and_then(|pane| pane.external_binding.as_ref()) {
+            let mut terminal = TerminalState::new(
+                binding.terminal_id.clone(),
+                saved_pane.map(|pane| pane.cwd.clone()).unwrap_or_default(),
+            );
+            terminal.external_binding = Some(binding.clone());
+            terminal.external_checkpoint =
+                saved_pane.and_then(|pane| pane.external_checkpoint.clone());
+            if let Some(label) = saved_pane.and_then(|pane| pane.label.clone()) {
+                terminal.set_manual_label(label);
+            }
+            panes.insert(*id, PaneState::new(binding.terminal_id.clone()));
+            terminals.push(terminal);
+            continue;
+        }
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
@@ -580,6 +651,7 @@ fn restore_tab(
                         master_fd: imported.master_fd,
                         state: imported.state.with_pane_id(*id),
                     },
+                    &cwd,
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,
@@ -1010,6 +1082,31 @@ mod tests {
     }
 
     #[test]
+    fn external_only_classification_requires_an_external_layout_pane() {
+        let snapshot = WorkspaceSnapshot {
+            id: Some("empty-pane-metadata".into()),
+            custom_name: None,
+            identity_cwd: PathBuf::new(),
+            worktree_space: None,
+            public_pane_numbers: HashMap::new(),
+            next_public_pane_number: 0,
+            public_tab_numbers: Vec::new(),
+            next_public_tab_number: 0,
+            tabs: vec![TabSnapshot {
+                custom_name: None,
+                layout: LayoutSnapshot::Pane(0),
+                panes: HashMap::new(),
+                zoomed: false,
+                focused: Some(0),
+                root_pane: Some(0),
+            }],
+            active_tab: 0,
+        };
+
+        assert!(!snapshot_is_external_only(&snapshot));
+    }
+
+    #[test]
     fn restore_plan_respects_opt_in_and_allowlist() {
         let pi_session_path = test_session_path("pi-session.jsonl");
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
@@ -1168,6 +1265,291 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_restore_preserves_identity_without_a_local_runtime() {
+        let pane = serde_json::json!({"cwd":"/remote/nonexistent/project", "label":"remote",
+        "external_binding": {
+            "kind":"coven", "terminal_id":"coven_external", "provider_id":"fixture",
+            "host_id":"host", "scope":{"projectId":"project", "profileId":"profile", "policyGeneration":1},
+            "authority":{"id":"authority", "generation":1}, "session_id":"session", "generation":1,
+            "pinned_source":null
+        }});
+        let json = serde_json::json!({"version":4,"active":0,"selected":0,"workspaces":[{
+            "identity_cwd":"/remote/nonexistent/project", "tabs":[{
+                "layout":{"Pane":1},
+                "zoomed":false,"panes":{"1":pane}
+            }]
+        }]});
+        let snapshot = super::super::snapshot::parse_snapshot(&json.to_string()).unwrap();
+        let (events, _receiver) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/must-never-launch-this-shell",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].tabs[0].panes.len(), 1);
+        assert_eq!(terminals.len(), 1);
+        workspaces[0].assert_invariants_for_test();
+        assert!(runtimes.is_empty());
+        let terminal = terminals.values().next().unwrap();
+        assert_eq!(terminal.cwd, PathBuf::from("/remote/nonexistent/project"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("remote"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.launch_argv.is_none());
+        let captured = super::super::snapshot::capture(
+            &workspaces,
+            &terminals,
+            &crate::terminal::TerminalRuntimeRegistry::from(runtimes),
+            Some(0),
+            0,
+        );
+        assert_eq!(captured.version, 4);
+        assert!(captured.validate_external_bindings().is_ok());
+        assert_eq!(
+            captured.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .filter(|p| p
+                    .external_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.terminal_id.as_str() == "coven_external"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_native_external_restore_preserves_local_git_identity_and_worktree_space() {
+        // Use only a synthetic snapshot and Git marker files. The native pane
+        // carries deferred resume metadata so this regression test never
+        // starts a shell or contacts an external provider.
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restore-mixed-native-external-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let native_cwd = root.join("native");
+        std::fs::create_dir_all(&native_cwd).unwrap();
+
+        let git_space = crate::workspace::git_space_metadata(&root)
+            .expect("synthetic Git marker should provide workspace identity");
+        let membership = crate::workspace::WorktreeSpaceMembership {
+            key: git_space.key.clone(),
+            label: "mixed-space".into(),
+            repo_root: root.clone(),
+            checkout_path: root.clone(),
+            is_linked_worktree: false,
+        };
+        let root_text = root.display().to_string();
+        let native_cwd_text = native_cwd.display().to_string();
+        let json = serde_json::json!({
+            "version": 4,
+            "active": 0,
+            "selected": 0,
+            "workspaces": [{
+                "id": "mixed",
+                "identity_cwd": root_text,
+                "worktree_space": {
+                    "key": membership.key,
+                    "label": membership.label,
+                    "repo_root": root.display().to_string(),
+                    "checkout_path": root.display().to_string(),
+                    "is_linked_worktree": false
+                },
+                "tabs": [{
+                    "layout": {"Split": {
+                        "direction": "Horizontal",
+                        "ratio": 0.5,
+                        "first": {"Pane": 0},
+                        "second": {"Pane": 1}
+                    }},
+                    "zoomed": false,
+                    "focused": 0,
+                    "root_pane": 0,
+                    "panes": {
+                        "0": {
+                            "cwd": native_cwd_text,
+                            "label": "native",
+                            "agent_session": {
+                                "source": "herdr:codex",
+                                "agent": "codex",
+                                "kind": "id",
+                                "value": "native-session"
+                            }
+                        },
+                        "1": {
+                            "cwd": "/remote/mixed/project",
+                            "label": "remote",
+                            "external_binding": {
+                                "kind": "coven",
+                                "terminal_id": "coven_external",
+                                "provider_id": "fixture",
+                                "host_id": "host",
+                                "scope": {
+                                    "projectId": "project",
+                                    "profileId": "profile",
+                                    "policyGeneration": 1
+                                },
+                                "authority": {"id": "authority", "generation": 1},
+                                "session_id": "session",
+                                "generation": 1,
+                                "pinned_source": null
+                            }
+                        }
+                    }
+                }],
+                "active_tab": 0
+            }]
+        });
+        let snapshot = super::super::snapshot::parse_snapshot(&json.to_string())
+            .expect("mixed native/external snapshot should parse");
+        let (events, _receiver) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/must-never-launch-this-shell",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].tabs.len(), 1);
+        assert_eq!(workspaces[0].tabs[0].panes.len(), 2);
+        assert_eq!(terminals.len(), 2);
+        assert!(runtimes.is_empty());
+        let workspace = &workspaces[0];
+        assert_eq!(workspace.worktree_space.as_ref(), Some(&membership));
+        assert_eq!(workspace.cached_git_space.as_ref(), Some(&git_space));
+        assert_eq!(workspace.cached_git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            workspace.cached_auto_label,
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .expect("synthetic repo should have a UTF-8 name")
+        );
+
+        let native = terminals
+            .values()
+            .find(|terminal| terminal.cwd == native_cwd)
+            .expect("native pane should restore its terminal identity");
+        assert!(native.external_binding.is_none());
+        assert!(native.pending_agent_resume_plan.is_some());
+        assert_eq!(native.manual_label.as_deref(), Some("native"));
+
+        let external = terminals
+            .values()
+            .find(|terminal| terminal.external_binding.is_some())
+            .expect("external pane should restore its provider identity");
+        assert_eq!(external.cwd, PathBuf::from("/remote/mixed/project"));
+        assert_eq!(external.manual_label.as_deref(), Some("remote"));
+        assert!(external.pending_agent_resume_plan.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_only_restore_does_not_infer_local_identity_from_identity_cwd() {
+        // The path is a real local Git directory only to prove that the
+        // identity_cwd field itself is not local provenance for an external pane.
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restore-external-remote-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let _git_space = crate::workspace::git_space_metadata(&root)
+            .expect("synthetic Git marker should provide workspace identity");
+        let json = serde_json::json!({
+            "version": 4,
+            "active": 0,
+            "selected": 0,
+            "workspaces": [{
+                "id": "external-remote-path",
+                "identity_cwd": root.display().to_string(),
+                "tabs": [{
+                    "layout": {"Pane": 1},
+                    "zoomed": false,
+                    "panes": {
+                        "1": {
+                            "cwd": "/remote/project",
+                            "label": "remote",
+                            "external_binding": {
+                                "kind": "coven",
+                                "terminal_id": "coven_external",
+                                "provider_id": "fixture",
+                                "host_id": "host",
+                                "scope": {
+                                    "projectId": "project",
+                                    "profileId": "profile",
+                                    "policyGeneration": 1
+                                },
+                                "authority": {"id": "authority", "generation": 1},
+                                "session_id": "session",
+                                "generation": 1,
+                                "pinned_source": null
+                            }
+                        }
+                    }
+                }],
+                "active_tab": 0
+            }]
+        });
+        let snapshot = super::super::snapshot::parse_snapshot(&json.to_string())
+            .expect("external snapshot should parse");
+        assert!(snapshot.workspaces[0].worktree_space.is_none());
+        let (events, _receiver) = mpsc::channel(4);
+
+        let (workspaces, _terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/must-never-launch-this-shell",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        assert_eq!(workspaces.len(), 1);
+        assert!(runtimes.is_empty());
+        let workspace = &workspaces[0];
+        assert_eq!(workspace.cached_auto_label, "Coven");
+        assert!(workspace.cached_git_space.is_none());
+        assert!(workspace.cached_git_branch.is_none());
+        assert!(workspace.worktree_space.is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn restore_carries_persisted_agent_session_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1187,6 +1569,8 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            external_binding: None,
+                            external_checkpoint: None,
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1273,6 +1657,8 @@ mod tests {
                         (
                             10,
                             super::super::snapshot::PaneSnapshot {
+                                external_binding: None,
+                                external_checkpoint: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1284,6 +1670,8 @@ mod tests {
                         (
                             20,
                             super::super::snapshot::PaneSnapshot {
+                                external_binding: None,
+                                external_checkpoint: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1337,6 +1725,8 @@ mod tests {
             (
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
+                    external_binding: None,
+                    external_checkpoint: None,
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -1347,6 +1737,8 @@ mod tests {
             )
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
+            external_binding: None,
+            external_checkpoint: None,
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -1498,6 +1890,8 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            external_binding: None,
+                            external_checkpoint: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1664,6 +2058,8 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                external_binding: None,
+                external_checkpoint: None,
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

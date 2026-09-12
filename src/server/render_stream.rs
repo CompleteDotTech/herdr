@@ -377,12 +377,16 @@ impl Backend for CursorTrackingBackend {
     }
 }
 
-pub(crate) type RenderedTabSurface = (
-    ratatui::buffer::Buffer,
-    Option<CursorState>,
-    Vec<((u16, u16), String, String)>,
-    crate::ui::TabSurfaceLayout,
-);
+pub(crate) struct RenderedTabSurface {
+    pub(crate) buffer: ratatui::buffer::Buffer,
+    pub(crate) cursor: Option<CursorState>,
+    pub(crate) hyperlinks: Vec<((u16, u16), String, String)>,
+    pub(crate) layout: crate::ui::TabSurfaceLayout,
+    pub(crate) external_snapshots: std::collections::HashMap<
+        crate::layout::PaneId,
+        crate::terminal::external::ExternalTerminalSnapshot,
+    >,
+}
 
 /// Renders only the active tab's pane surface at an origin-relative client viewport.
 pub(crate) fn render_tab_surface_virtual(
@@ -393,36 +397,56 @@ pub(crate) fn render_tab_surface_virtual(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> RenderedTabSurface {
-    let layout = crate::ui::compute_tab_surface_for(
+    let external_snapshots =
+        crate::ui::capture_external_snapshots(app_state, terminal_runtimes, target);
+    let layout = crate::ui::compute_tab_surface_for_with_external_snapshots(
         app_state,
         terminal_runtimes,
         target,
         area,
         resize_panes,
         cell_size,
+        Some(&external_snapshots),
     );
     let surface = crate::ui::TabSurfaceView {
         target: layout.target,
         pane_infos: &layout.pane_infos,
         split_borders: &layout.split_borders,
     };
-    let cursor = crate::ui::tab_surface_cursor(app_state, terminal_runtimes, surface);
-    let hyperlinks = crate::ui::tab_surface_hyperlinks(app_state, terminal_runtimes, surface);
+    let cursor = crate::ui::tab_surface_cursor(
+        app_state,
+        terminal_runtimes,
+        surface,
+        Some(&external_snapshots),
+    );
+    let hyperlinks = crate::ui::tab_surface_hyperlinks(
+        app_state,
+        terminal_runtimes,
+        surface,
+        Some(&external_snapshots),
+    );
 
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
     terminal
         .draw(|frame| {
-            crate::ui::render_tab_surface(app_state, terminal_runtimes, surface, frame);
+            crate::ui::render_tab_surface(
+                app_state,
+                terminal_runtimes,
+                surface,
+                Some(&external_snapshots),
+                frame,
+            );
         })
         .expect("render to TestBackend should never fail");
 
-    (
-        terminal.backend().buffer().clone(),
+    RenderedTabSurface {
+        buffer: terminal.backend().buffer().clone(),
         cursor,
         hyperlinks,
         layout,
-    )
+        external_snapshots,
+    }
 }
 
 /// Renders one server-owned terminal directly for `terminal attach` clients.
@@ -457,6 +481,44 @@ pub(crate) fn render_terminal_virtual(
         });
 
     (buffer, cursor)
+}
+
+type ExternalTerminalFrame = (
+    ratatui::buffer::Buffer,
+    Option<CursorState>,
+    Vec<((u16, u16), String, String)>,
+    crate::terminal::external::ExternalRenderOutput,
+);
+
+/// Render one external model into the same origin-relative frame shape used
+/// by native terminal attach. The model is copied and validated by the
+/// session before this function converts it to protocol data.
+pub(crate) fn render_external_terminal_virtual(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    area: Rect,
+    focused: bool,
+) -> Result<ExternalTerminalFrame, crate::terminal::external::ExternalSessionError> {
+    let render_area = Rect::new(0, 0, area.width, area.height);
+    let mut buffer = ratatui::buffer::Buffer::empty(render_area);
+    let output = session.render(&mut buffer, render_area, focused)?;
+    let cursor = output.cursor.map(|cursor| CursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible,
+        shape: crate::terminal::external::cursor_shape(cursor.shape),
+    });
+    let hyperlinks = output
+        .hyperlinks
+        .iter()
+        .map(|link| {
+            (
+                (link.position.x, link.position.y),
+                link.symbol.clone(),
+                link.uri.clone(),
+            )
+        })
+        .collect();
+    Ok((buffer, cursor, hyperlinks, output))
 }
 
 #[cfg(test)]

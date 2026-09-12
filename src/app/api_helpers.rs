@@ -82,6 +82,39 @@ pub(super) fn encode_api_input(
     Ok(bytes)
 }
 
+/// Encode API input for a checkpoint-backed external terminal. The external
+/// model reports bracketed-paste mode as part of its coherent snapshot; key
+/// bytes use the shared legacy/xterm encoder because the checkpoint contract
+/// intentionally does not expose a native Ghostty keyboard protocol.
+pub(super) fn encode_external_api_input(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    text: &str,
+    keys: &[String],
+) -> Result<Vec<u8>, String> {
+    let bracketed = session
+        .render_snapshot()
+        .map_err(|error| error.to_string())?
+        .modes
+        .bracketed_paste;
+    let mut bytes = if text.is_empty() {
+        Vec::new()
+    } else if bracketed {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    };
+    for key in keys {
+        let Some(key_event) = parse_api_key(key) else {
+            return Err(key.clone());
+        };
+        bytes.extend_from_slice(&crate::input::encode_key(
+            key_event,
+            crate::input::KeyboardProtocol::Legacy,
+        ));
+    }
+    Ok(bytes)
+}
+
 pub(super) fn detect_state_from_api(
     state: crate::api::schema::PaneAgentState,
 ) -> crate::detect::AgentState {

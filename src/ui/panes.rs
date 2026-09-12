@@ -204,6 +204,96 @@ fn stable_scrollbar_gutter(
     (inner_rect, scrollbar_rect)
 }
 
+fn stable_external_scrollbar_gutter(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    pane_inner: Rect,
+    pane_scrollbars: bool,
+) -> (Rect, Option<Rect>) {
+    let Ok(snapshot) = session.render_snapshot() else {
+        return (pane_inner, None);
+    };
+    if !pane_scrollbars
+        || pane_inner.width <= 4
+        || snapshot.modes.alternate_screen
+        || snapshot.scroll.max_offset_from_bottom == 0
+    {
+        return (pane_inner, None);
+    }
+    let inner_rect = Rect::new(
+        pane_inner.x,
+        pane_inner.y,
+        pane_inner.width.saturating_sub(1),
+        pane_inner.height,
+    );
+    let gutter = Rect::new(
+        pane_inner.x + pane_inner.width.saturating_sub(1),
+        pane_inner.y,
+        1,
+        pane_inner.height,
+    );
+    (inner_rect, Some(gutter))
+}
+
+fn stable_external_snapshot_scrollbar_gutter(
+    snapshot: &crate::terminal::external::ExternalTerminalSnapshot,
+    pane_inner: Rect,
+    pane_scrollbars: bool,
+) -> (Rect, Option<Rect>) {
+    if !pane_scrollbars
+        || pane_inner.width <= 4
+        || snapshot.modes.alternate_screen
+        || snapshot.scroll.max_offset_from_bottom == 0
+    {
+        return (pane_inner, None);
+    }
+    let inner_rect = Rect::new(
+        pane_inner.x,
+        pane_inner.y,
+        pane_inner.width.saturating_sub(1),
+        pane_inner.height,
+    );
+    let gutter = Rect::new(
+        pane_inner.x + pane_inner.width.saturating_sub(1),
+        pane_inner.y,
+        1,
+        pane_inner.height,
+    );
+    (inner_rect, Some(gutter))
+}
+
+fn submit_external_resize(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    terminal_id: &crate::terminal::TerminalId,
+    inner_rect: Rect,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) {
+    let Some(binding) = app
+        .terminals
+        .get(terminal_id)
+        .and_then(|terminal| terminal.external_binding.as_ref())
+        .map(|binding| binding.execution.clone())
+    else {
+        return;
+    };
+    let Some(runtime) = terminal_runtimes.external(terminal_id) else {
+        return;
+    };
+    // The provider worker must have completed the typed checkpoint attach
+    // before a resize can be admitted; otherwise a render tick could enqueue
+    // a control command ahead of its negotiated identity.
+    if terminal_runtimes.external_session(terminal_id).is_none() {
+        return;
+    }
+    let _ = runtime.submit_external_resize(
+        binding,
+        inner_rect.height,
+        inner_rect.width,
+        u16::try_from(cell_size.width_px).unwrap_or(u16::MAX),
+        u16::try_from(cell_size.height_px).unwrap_or(u16::MAX),
+    );
+}
+
 /// Resize every visible runtime in a tab to the geometry it would receive if the tab were selected.
 pub(super) fn resize_tab_panes(
     app: &AppState,
@@ -264,6 +354,7 @@ pub(super) fn resize_tab_panes(
 }
 
 /// Compute pane layout info and optionally resize pane runtimes to match.
+#[cfg(test)]
 pub(super) fn compute_pane_infos_for_tab(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -272,6 +363,33 @@ pub(super) fn compute_pane_infos_for_tab(
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+) -> Vec<PaneInfo> {
+    compute_pane_infos_for_tab_with_external_snapshots(
+        app,
+        terminal_runtimes,
+        ws_idx,
+        tab_idx,
+        area,
+        resize_panes,
+        cell_size,
+        None,
+    )
+}
+
+pub(super) fn compute_pane_infos_for_tab_with_external_snapshots(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    ws_idx: usize,
+    tab_idx: usize,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    external_snapshots: Option<
+        &std::collections::HashMap<
+            crate::layout::PaneId,
+            crate::terminal::external::ExternalTerminalSnapshot,
+        >,
+    >,
 ) -> Vec<PaneInfo> {
     let Some(tab) = app
         .workspaces
@@ -307,6 +425,24 @@ pub(super) fn compute_pane_infos_for_tab(
                     cell_size.width_px,
                     cell_size.height_px,
                 );
+            }
+        } else if let Some(terminal_id) = tab.terminal_id(focused_id) {
+            if let Some(snapshot) =
+                external_snapshots.and_then(|snapshots| snapshots.get(&focused_id))
+            {
+                (inner_rect, scrollbar_rect) = stable_external_snapshot_scrollbar_gutter(
+                    snapshot,
+                    pane_inner,
+                    app.pane_scrollbars,
+                );
+            } else if external_snapshots.is_none() {
+                if let Some(session) = terminal_runtimes.external_session(terminal_id) {
+                    (inner_rect, scrollbar_rect) =
+                        stable_external_scrollbar_gutter(session, pane_inner, app.pane_scrollbars);
+                }
+            }
+            if resize_panes && !app.direct_attach_resize_locks.contains(terminal_id) {
+                submit_external_resize(app, terminal_runtimes, terminal_id, inner_rect, cell_size);
             }
         }
         return vec![PaneInfo {
@@ -345,6 +481,23 @@ pub(super) fn compute_pane_infos_for_tab(
                     cell_size.width_px,
                     cell_size.height_px,
                 );
+            }
+        } else if let Some(terminal_id) = tab.terminal_id(info.id) {
+            if let Some(snapshot) = external_snapshots.and_then(|snapshots| snapshots.get(&info.id))
+            {
+                (inner_rect, scrollbar_rect) = stable_external_snapshot_scrollbar_gutter(
+                    snapshot,
+                    pane_inner,
+                    app.pane_scrollbars,
+                );
+            } else if external_snapshots.is_none() {
+                if let Some(session) = terminal_runtimes.external_session(terminal_id) {
+                    (inner_rect, scrollbar_rect) =
+                        stable_external_scrollbar_gutter(session, pane_inner, app.pane_scrollbars);
+                }
+            }
+            if resize_panes && !app.direct_attach_resize_locks.contains(terminal_id) {
+                submit_external_resize(app, terminal_runtimes, terminal_id, inner_rect, cell_size);
             }
         }
 
@@ -391,6 +544,12 @@ pub(super) fn render_panes(
     target: Option<super::tab_surface::TabSurfaceTarget>,
     pane_infos: &[PaneInfo],
     split_borders: &[crate::layout::SplitBorder],
+    external_snapshots: Option<
+        &std::collections::HashMap<
+            crate::layout::PaneId,
+            crate::terminal::external::ExternalTerminalSnapshot,
+        >,
+    >,
 ) {
     let Some(ws_idx) = target.map(|target| target.workspace_index) else {
         return;
@@ -406,6 +565,53 @@ pub(super) fn render_panes(
                 && app.pane_exposes_host_cursor(ws_idx, info.id);
             rt.render(frame, info.inner_rect, show_cursor);
             render_pane_scrollbar(app, frame, info, rt);
+        } else if let Some(terminal_id) = ws.terminal_id(info.id) {
+            let rendered = if let Some(snapshots) = external_snapshots {
+                snapshots
+                    .get(&info.id)
+                    .and_then(|snapshot| {
+                        let output = snapshot
+                            .render_into_buffer(
+                                frame.buffer_mut(),
+                                info.inner_rect,
+                                crate::terminal::external::ExternalRenderOptions {
+                                    cursor: crate::terminal::external::ExternalCursorPolicy::ReadOnlyFocused {
+                                        focused: info.is_focused,
+                                    },
+                                },
+                            )
+                            .ok()?;
+                        Some(output)
+                    })
+            } else {
+                terminal_runtimes
+                    .external_session(terminal_id)
+                    .and_then(|session| {
+                        session
+                            .render(frame.buffer_mut(), info.inner_rect, info.is_focused)
+                            .ok()
+                    })
+            };
+            if let Some(output) = rendered {
+                if let Some(track) = info.scrollbar_rect {
+                    crate::ui::scrollbar::render_pane_scrollbar_buffer(
+                        frame.buffer_mut(),
+                        crate::terminal::external::pane_scroll_metrics(output.scroll),
+                        track,
+                        &app.palette,
+                        info.is_focused,
+                    );
+                }
+            } else if let Some(terminal) = app.terminals.get(terminal_id) {
+                if terminal.external_binding.is_some() {
+                    crate::runtime_provider::transcript_view::render(
+                        terminal,
+                        frame.buffer_mut(),
+                        info.inner_rect,
+                        &app.palette,
+                    );
+                }
+            }
         }
     }
 

@@ -1249,6 +1249,7 @@ async fn run_terminal_compression_task(
 /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
 /// compression step may finish before releasing its terminal reference.
 pub struct PaneRuntime {
+    _cleanup_admission: Option<crate::cleanup::ownership::Admission>,
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
@@ -2084,8 +2085,11 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
+    // Handoff carries persisted cwd independently of the frozen runtime payload.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_handoff_fd(
         import: crate::handoff_runtime::ImportedHandoffRuntime,
+        persisted_cwd: &std::path::Path,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -2094,6 +2098,9 @@ impl PaneRuntime {
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
         let crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state } = import;
+        let owned_cwd = crate::platform::process_cwd(state.child_pid)
+            .unwrap_or_else(|| persisted_cwd.to_path_buf());
+        let cleanup_admission = crate::cleanup::ownership::admit_runtime(&owned_cwd)?;
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
@@ -2241,6 +2248,7 @@ impl PaneRuntime {
             terminal,
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
+            _cleanup_admission: cleanup_admission,
             child_pid,
             reported_cwd,
             child_wait_completed: None,
@@ -2275,6 +2283,12 @@ impl PaneRuntime {
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
+        let launch_cwd = cmd
+            .get_cwd()
+            .map(std::path::PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        let cleanup_admission = crate::cleanup::ownership::admit_runtime(&launch_cwd)?;
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
@@ -2817,6 +2831,7 @@ impl PaneRuntime {
             terminal,
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
+            _cleanup_admission: cleanup_admission,
             child_pid,
             reported_cwd,
             child_wait_completed: Some(child_wait_completed),
@@ -3465,6 +3480,7 @@ impl PaneRuntime {
             Self {
                 pane_id,
                 terminal,
+                _cleanup_admission: None,
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
@@ -4194,6 +4210,7 @@ mod tests {
         ));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
+            _cleanup_admission: None,
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
@@ -4231,6 +4248,7 @@ mod tests {
         ));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let runtime = PaneRuntime {
+            _cleanup_admission: None,
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {

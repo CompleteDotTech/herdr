@@ -35,6 +35,7 @@ struct RenderPipeline {
     app: App,
     client: ClientShellState,
     graphics_delivery: crate::kitty_graphics::surface::DeliveryCache,
+    surface_codec: Option<crate::protocol::surface::SurfaceCodec>,
 }
 
 impl RenderPipeline {
@@ -69,6 +70,7 @@ impl RenderPipeline {
             app,
             client,
             graphics_delivery: crate::kitty_graphics::surface::DeliveryCache::default(),
+            surface_codec: None,
         }
     }
 
@@ -96,11 +98,8 @@ impl RenderPipeline {
             &self.graphics_delivery,
             1,
         );
-        let server_elapsed = started.elapsed();
         self.graphics_delivery = rendered.graphics_delivery;
-
-        let started = Instant::now();
-        self.client.set_pane_surface(PaneSurfaceFrame {
+        let surface = PaneSurfaceFrame {
             boot_id: "bench-boot".into(),
             projection_revision: 1,
             surface_revision: 0,
@@ -109,7 +108,39 @@ impl RenderPipeline {
             splits: rendered.splits,
             popup: rendered.popup,
             graphics: rendered.graphics,
-        });
+        };
+        let (surface, encoded) = if let Some(codec) = self.surface_codec {
+            let encoded = codec
+                .frame(
+                    &crate::protocol::ServerMessage::PaneSurface(surface),
+                    crate::protocol::MAX_FRAME_SIZE,
+                )
+                .expect("encode benchmark surface");
+            (None, Some(encoded))
+        } else {
+            (Some(surface), None)
+        };
+        let server_elapsed = started.elapsed();
+        let started = Instant::now();
+        let surface = if let Some(bytes) = encoded {
+            let message = crate::protocol::read_message(
+                &mut bytes.as_slice(),
+                crate::protocol::MAX_FRAME_SIZE,
+            )
+            .expect("decode benchmark frame");
+            let message = self
+                .surface_codec
+                .expect("selected codec")
+                .decode(message, crate::protocol::MAX_FRAME_SIZE)
+                .expect("decode benchmark surface");
+            let crate::protocol::ServerMessage::PaneSurface(surface) = message else {
+                panic!("surface expected")
+            };
+            surface
+        } else {
+            surface.expect("unencoded benchmark surface")
+        };
+        self.client.set_pane_surface(surface);
         black_box(
             self.client
                 .compose(COLS, ROWS)
@@ -320,4 +351,78 @@ async fn render_scale_profile() {
     print_profiles("active panes (one workspace)", active_panes);
     print_snapshot_encoding_profiles("active panes", active_panes);
     print_token_rule_profiles();
+}
+
+fn codec_pipeline(
+    count: usize,
+    external: bool,
+    codec: crate::protocol::surface::SurfaceCodec,
+) -> RenderPipeline {
+    let mut pipeline = RenderPipeline::new(active_panes(count));
+    pipeline.surface_codec = Some(codec);
+    if external {
+        pipeline.app.state.ensure_test_terminals();
+        let mut ids = Vec::new();
+        for workspace in &mut pipeline.app.state.workspaces {
+            workspace.test_runtimes.clear();
+            for tab in &workspace.tabs {
+                for pane in tab.layout.pane_ids() {
+                    ids.push(tab.terminal_id(pane).expect("terminal identity").clone());
+                }
+            }
+        }
+        // Retained history and model revisions are fixed for this render/codec
+        // profile. Provider parse/checkpoint throughput is a separate benchmark.
+        let text = (0..80)
+            .map(|line| format!("line-{line}: 界 ❤\u{fe0f} B\r\n"))
+            .collect::<String>();
+        for id in ids {
+            let session = crate::terminal::external::ExternalTerminalSession::new(
+                coven_terminal::Geometry::new(COLS, ROWS),
+                coven_terminal::QueryReplyPolicy::Quiet,
+                1024 * 1024,
+                256,
+                herdr_external_terminal_integration_v1::ExternalTheme::default(),
+            )
+            .expect("external model");
+            session
+                .ingest(coven_terminal::RawChunk::new(
+                    coven_terminal::SessionCursor::START,
+                    text.as_bytes().to_vec(),
+                ))
+                .expect("populate model");
+            pipeline
+                .app
+                .terminal_runtimes
+                .attach_external_session(id, std::sync::Arc::new(session))
+                .expect("attach model");
+        }
+    }
+    pipeline
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual negotiated surface codec scaling profile"]
+async fn render_scale_profile_surface_codec() {
+    use crate::protocol::surface::SurfaceCodec;
+    for external in [false, true] {
+        for codec in [SurfaceCodec::V1, SurfaceCodec::V2] {
+            let rows = [1, 15].map(|count| {
+                (
+                    count,
+                    profile_pipeline(codec_pipeline(count, external, codec)),
+                )
+            });
+            println!(
+                "surface codec={} external={} geometry={}x{} steady model revision",
+                codec.name(),
+                external,
+                COLS,
+                ROWS
+            );
+            print_stage("server render and encode", &rows, |stats| stats.server);
+            print_stage("client decode and composition", &rows, |stats| stats.client);
+            print_stage("combined pipeline", &rows, |stats| stats.total);
+        }
+    }
 }

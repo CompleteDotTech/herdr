@@ -536,6 +536,12 @@ impl Tab {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
         let terminal_id = self.terminal_id(pane_id)?;
+        if terminals
+            .get(terminal_id)
+            .is_some_and(|terminal| terminal.external_binding.is_some())
+        {
+            return None;
+        }
         terminal_runtimes
             .get(terminal_id)
             .and_then(|rt| rt.cwd())

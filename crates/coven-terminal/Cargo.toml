@@ -1,0 +1,25 @@
+[package]
+name = "coven-terminal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+description = "Shared raw-byte terminal runtime and checkpoint envelope for Coven and Herdr"
+
+[features]
+default = ["serde-json", "alacritty-engine"]
+serde-json = ["dep:serde_json"]
+alacritty-engine = ["dep:alacritty_terminal", "dep:vte"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
+# These are intentionally path dependencies.  The two fork worktrees are
+# owned by their respective implementation agents; this crate only consumes
+# their typed checkpoint APIs.
+alacritty_terminal = { package = "alacritty_terminal", path = "../../vendor/alacritty-terminal-checkpoint", version = "0.26.0", optional = true }
+vte = { path = "../../vendor/vte-checkpoint", version = "0.15.0", default-features = false, features = ["std", "ansi", "checkpoint"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"

@@ -386,13 +386,22 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             || !retryable_timeout
             || pinned_terminal_id.is_none()
             || pane_terminal_id(&pane_id)? != pinned_terminal_id
-            || !pane_shell_is_initializing(&pane_id)?
         {
             return super::print_response(&response);
         }
 
+        // Start the bounded readiness window when the first busy response is
+        // observed.  The process-info probe itself can be delayed while the
+        // server walks a changing process tree; starting the deadline after
+        // that probe lets a shell become available just as the retry window
+        // expires and turns the expected busy response into an unintended
+        // launch.
         let deadline = *retry_deadline
             .get_or_insert_with(|| Instant::now() + PANE_SHELL_READINESS_RETRY_TIMEOUT);
+        if Instant::now() >= deadline || !pane_shell_is_initializing(&pane_id)? {
+            return super::print_response(&response);
+        }
+
         previous_busy_response = Some(response);
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

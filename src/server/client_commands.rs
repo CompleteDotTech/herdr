@@ -1,5 +1,5 @@
 use std::io;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -53,12 +53,39 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "worktree.remove",
 ];
 
+const RUNTIME_PROVIDER_METHODS: &[&str] = &[
+    "runtime_provider.attach",
+    "runtime_provider.attachment.get",
+    "runtime_provider.detach",
+    "runtime_provider.execute",
+    "runtime_provider.get",
+    "runtime_provider.list",
+    "runtime_provider.operation.get",
+    "runtime_provider.takeover",
+];
+
+const CLEANUP_METHODS: &[&str] = &["worktree.cleanup"];
+
 pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {
-    CLIENT_SHELL_METHODS
+    static ADVERTISED_METHODS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    ADVERTISED_METHODS
+        .get_or_init(|| {
+            let mut methods =
+                Vec::with_capacity(CLIENT_SHELL_METHODS.len() + RUNTIME_PROVIDER_METHODS.len());
+            methods.extend_from_slice(CLIENT_SHELL_METHODS);
+            methods.extend_from_slice(RUNTIME_PROVIDER_METHODS);
+            methods.extend_from_slice(CLEANUP_METHODS);
+            methods.sort_unstable();
+            methods.dedup();
+            methods
+        })
+        .as_slice()
 }
 
 pub(crate) fn supports_client_shell_method_name(method: &str) -> bool {
     CLIENT_SHELL_METHODS.contains(&method)
+        || RUNTIME_PROVIDER_METHODS.contains(&method)
+        || CLEANUP_METHODS.contains(&method)
 }
 
 pub(crate) fn supports_client_shell_method(method: &Method) -> bool {
@@ -278,6 +305,54 @@ mod tests {
         digests
     }
 
+    fn runtime_provider_method_shape_digests() -> BTreeMap<String, String> {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::api::schema::Request))
+            .expect("request schema");
+        let definitions = schema
+            .get("$defs")
+            .and_then(serde_json::Value::as_object)
+            .expect("request definitions");
+        let branches = schema
+            .get("oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("request method branches");
+        let mut digests = BTreeMap::new();
+
+        for method in RUNTIME_PROVIDER_METHODS {
+            let branch = branches
+                .iter()
+                .find(|branch| {
+                    branch
+                        .pointer("/properties/method/const")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(method)
+                })
+                .unwrap_or_else(|| panic!("missing request schema branch for {method}"));
+            let mut referenced_names = BTreeSet::new();
+            collect_schema_refs(branch, &mut referenced_names);
+            let mut visited_names = BTreeSet::new();
+            let mut selected_definitions = serde_json::Map::new();
+            while let Some(name) = referenced_names.pop_first() {
+                if !visited_names.insert(name.clone()) {
+                    continue;
+                }
+                let definition = definitions
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("missing schema definition {name} for {method}"));
+                collect_schema_refs(definition, &mut referenced_names);
+                selected_definitions.insert(name, normalized_wire_schema(definition));
+            }
+            let shape = serde_json::json!({
+                "request": normalized_wire_schema(branch),
+                "definitions": selected_definitions,
+            });
+            let bytes = serde_json::to_vec(&shape).expect("method shape json");
+            digests.insert(method.to_string(), format!("{:x}", Sha256::digest(bytes)));
+        }
+
+        digests
+    }
+
     #[test]
     fn advertised_client_shell_method_shapes_stay_at_the_v1_contract() {
         let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
@@ -288,8 +363,7 @@ mod tests {
         let actual = endpoint_method_shape_digests();
 
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"
         );
     }
@@ -332,6 +406,39 @@ mod tests {
                 schema_methods.iter().any(|candidate| candidate == method),
                 "advertised endpoint method {method:?} is absent from the request schema"
             );
+        }
+    }
+
+    #[test]
+    fn advertised_runtime_provider_method_shapes_have_a_separate_contract() {
+        let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/endpoint-runtime-provider-method-shapes-v1.json"
+        )))
+        .expect("runtime provider endpoint method shape fixture");
+        let actual = runtime_provider_method_shape_digests();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn runtime_provider_methods_are_a_sorted_disjoint_extension() {
+        assert!(RUNTIME_PROVIDER_METHODS
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert!(RUNTIME_PROVIDER_METHODS
+            .iter()
+            .all(|method| !CLIENT_SHELL_METHODS.contains(method)));
+
+        let advertised = supported_client_shell_method_names();
+        assert!(advertised.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            advertised.len(),
+            CLIENT_SHELL_METHODS.len() + RUNTIME_PROVIDER_METHODS.len() + CLEANUP_METHODS.len()
+        );
+        for method in RUNTIME_PROVIDER_METHODS {
+            assert!(advertised.contains(method));
+            assert!(supports_client_shell_method_name(method));
         }
     }
 

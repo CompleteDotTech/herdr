@@ -39,7 +39,8 @@ pub(crate) use self::sidebar::{
 use self::status::copy_feedback_rect;
 pub(crate) use self::status::{render_config_diagnostic_buffer, render_copy_feedback_buffer};
 pub(crate) use self::tab_surface::{
-    compute_tab_surface, compute_tab_surface_for, render_tab_surface, resize_tab_surface,
+    capture_external_snapshots, compute_tab_surface, compute_tab_surface_for,
+    compute_tab_surface_for_with_external_snapshots, render_tab_surface, resize_tab_surface,
     tab_surface_cursor, tab_surface_hyperlinks, TabSurfaceLayout, TabSurfaceTarget, TabSurfaceView,
 };
 pub(crate) use self::text::truncate_end;

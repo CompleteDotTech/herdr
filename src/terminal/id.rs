@@ -21,6 +21,18 @@ impl TerminalId {
         Self(format!("term_{micros:x}{counter:x}"))
     }
 
+    pub(crate) fn try_alloc_external() -> Option<Self> {
+        static NEXT_EXTERNAL_ID: AtomicU64 = AtomicU64::new(1);
+        let counter = NEXT_EXTERNAL_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .ok()?;
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_micros();
+        Some(Self(format!("coven_{micros:x}_{counter:x}")))
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }

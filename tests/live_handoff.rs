@@ -865,6 +865,100 @@ fn live_handoff_preserves_installed_plugins() {
 }
 
 #[test]
+fn live_handoff_runs_plugin_startup_hook_after_import() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = config_home.join("herdr-dev/herdr.sock");
+    let plugin_root = base.join("plugins/startup");
+    let capture = base.join("startup.log");
+
+    fs::create_dir_all(&plugin_root).unwrap();
+    fs::write(
+        plugin_root.join("herdr-plugin.toml"),
+        format!(
+            r#"id = "test.live-handoff-startup"
+name = "Live handoff startup hook"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[startup]]
+command = ["sh", "-c", "printf '%s:%s\\n' \"$HERDR_PLUGIN_ID\" \"$HERDR_PLUGIN_EVENT\" >> '{}'"]
+"#,
+            capture.display()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_default_session_server(&config_home, &runtime_dir);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    link_plugin(&api_socket, &plugin_root);
+    assert_eq!(
+        listed_plugin_ids(&api_socket),
+        ["test.live-handoff-startup"]
+    );
+    assert!(
+        !capture.exists(),
+        "startup hook should not run merely because a plugin was linked"
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let output = wait_for_file_contains(
+        &capture,
+        "test.live-handoff-startup:startup",
+        Duration::from_secs(10),
+    );
+    assert_eq!(
+        output.lines().count(),
+        1,
+        "handoff import should invoke the startup hook exactly once: {output:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let startup_log = loop {
+        let logs = request(
+            &api_socket,
+            serde_json::json!({
+                "id":"test:plugin:logs",
+                "method":"plugin.log.list",
+                "params":{"plugin_id":"test.live-handoff-startup","limit":10}
+            }),
+        );
+        assert_ok(logs.clone());
+        if let Some(log) = logs["result"]["logs"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["event"] == "startup"))
+        {
+            if log["status"] != "running" {
+                break log.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "startup hook did not settle");
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(startup_log["status"], "succeeded");
+    assert_eq!(startup_log["exit_code"], 0);
+    assert_eq!(
+        listed_plugin_ids(&api_socket),
+        ["test.live-handoff-startup"]
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
     let base = unique_test_dir();

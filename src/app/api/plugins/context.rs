@@ -42,6 +42,7 @@ impl App {
         correlation_id: &str,
     ) -> PluginInvocationContext {
         match &event.data {
+            EventData::WorktreeCleanup { .. } => empty_plugin_context(correlation_id),
             EventData::WorkspaceCreated { workspace }
             | EventData::WorkspaceUpdated { workspace }
             | EventData::WorkspaceMetadataUpdated { workspace }

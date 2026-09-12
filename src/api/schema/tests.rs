@@ -201,8 +201,7 @@ fn generated_protocol_schema_artifact_is_current() {
         )
     });
     assert_eq!(
-        expected,
-        actual,
+        expected, actual,
         "generated API schema artifact is stale; run `HERDR_UPDATE_API_SCHEMA=1 just test-one generated_protocol_schema_artifact_is_current`"
     );
 }

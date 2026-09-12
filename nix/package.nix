@@ -40,11 +40,14 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.intersection (lib.fileset.fromSource (lib.sources.cleanSource ./..)) (
       lib.fileset.unions [
         ../assets
+        ../crates
         ../docs/next/api/herdr-api.schema.json
         ../src
         ../vendor/libghostty-vt
         ../vendor/libghostty-vt.vendor.json
+        ../vendor/alacritty-terminal-checkpoint
         ../vendor/portable-pty
+        ../vendor/vte-checkpoint
         ../build.rs
         ../Cargo.lock
         ../Cargo.toml

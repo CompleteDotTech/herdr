@@ -8,6 +8,7 @@ pub mod integrations;
 pub mod panes;
 pub mod plugins;
 pub mod response;
+pub mod runtime_providers;
 pub mod server;
 pub mod session;
 pub mod tabs;
@@ -22,6 +23,7 @@ pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
+pub use runtime_providers::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
@@ -45,6 +47,8 @@ pub struct Request {
 // the simple serde shape and avoids boxing churn across every caller.
 #[allow(clippy::large_enum_variant)]
 pub enum Method {
+    #[serde(rename = "worktree.cleanup")]
+    WorktreeCleanup(crate::cleanup::service::Action),
     #[serde(rename = "ping")]
     Ping(PingParams),
     #[serde(rename = "server.stop")]
@@ -57,6 +61,22 @@ pub enum Method {
     ServerAgentManifests(EmptyParams),
     #[serde(rename = "server.reload_agent_manifests")]
     ServerReloadAgentManifests(EmptyParams),
+    #[serde(rename = "runtime_provider.list")]
+    RuntimeProviderList(EmptyParams),
+    #[serde(rename = "runtime_provider.get")]
+    RuntimeProviderGet(RuntimeProviderTarget),
+    #[serde(rename = "runtime_provider.attach")]
+    RuntimeProviderAttach(RuntimeProviderAttachParams),
+    #[serde(rename = "runtime_provider.takeover")]
+    RuntimeProviderTakeover(RuntimeProviderAttachmentTarget),
+    #[serde(rename = "runtime_provider.attachment.get")]
+    RuntimeProviderAttachmentGet(RuntimeProviderAttachmentTarget),
+    #[serde(rename = "runtime_provider.detach")]
+    RuntimeProviderDetach(RuntimeProviderAttachmentTarget),
+    #[serde(rename = "runtime_provider.execute")]
+    RuntimeProviderExecute(RuntimeProviderExecuteParams),
+    #[serde(rename = "runtime_provider.operation.get")]
+    RuntimeProviderOperationGet(RuntimeProviderOperationGetParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
     #[serde(rename = "product_announcement.dismiss")]

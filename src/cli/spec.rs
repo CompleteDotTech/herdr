@@ -46,7 +46,8 @@ pub(super) fn command() -> Command {
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
-        .subcommand(plugin_command());
+        .subcommand(plugin_command())
+        .subcommand(runtime_provider_command());
     configure_help(command, 0)
 }
 
@@ -985,6 +986,37 @@ fn required(name: &'static str, value_name: &'static str) -> Arg {
 
 fn path_arg(name: &'static str, value_name: &'static str) -> Arg {
     required(name, value_name).value_hint(ValueHint::AnyPath)
+}
+
+fn runtime_provider_command() -> Command {
+    Command::new("runtime-provider")
+        .about("Inspect or attach configured external execution providers")
+        .subcommand(Command::new("list").about("List configured providers"))
+        .subcommand(
+            Command::new("get")
+                .about("Inspect one configured provider")
+                .arg(required("provider", "PROVIDER")),
+        )
+        .subcommand(
+            Command::new("attachment")
+                .about("Inspect one external execution attachment")
+                .arg(required("terminal", "TERMINAL")),
+        )
+        .subcommand(
+            Command::new("detach")
+                .about("Detach Herdr without stopping the execution")
+                .arg(required("terminal", "TERMINAL")),
+        )
+        .subcommand(
+            Command::new("attach")
+                .about("Attach an existing provider execution")
+                .arg(required("provider", "PROVIDER"))
+                .arg(required("session", "SESSION"))
+                .arg(required("generation", "GENERATION"))
+                .arg(option("workspace", "ID"))
+                .arg(option("label", "LABEL"))
+                .arg(flag("focus")),
+        )
 }
 
 #[cfg(test)]

@@ -327,7 +327,7 @@ impl HeadlessServer {
         })
     }
 
-    fn terminal_id_for_pane(
+    pub(super) fn terminal_id_for_pane(
         &self,
         pane_id: crate::layout::PaneId,
     ) -> Option<&crate::terminal::TerminalId> {
@@ -475,6 +475,7 @@ impl HeadlessServer {
                 .map(|client| client.shell_graphics_delivery.clone())
                 .unwrap_or_default();
             let mut surface_parts = None;
+            let direct_focused = matches!(&mode, ClientConnectionMode::TerminalAttach { .. });
             let frame = match mode {
                 ClientConnectionMode::ClientShell => {
                     let render_started = crate::render_prof::timer();
@@ -510,39 +511,91 @@ impl HeadlessServer {
                 ClientConnectionMode::TerminalPending => continue,
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
-                    let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) else {
-                        self.send_to_client(
-                            client_id,
-                            ServerMessage::ServerShutdown {
-                                reason: Some(format!(
-                                    "terminal attach ended: terminal {terminal_id} not found"
-                                )),
-                            },
+                    if let Some(session) =
+                        self.external_session_for_terminal_id_string(&terminal_id)
+                    {
+                        let render_started = crate::render_prof::timer();
+                        let rendered =
+                            crate::server::render_stream::render_external_terminal_virtual(
+                                &session,
+                                area,
+                                direct_focused,
+                            );
+                        crate::render_prof::duration_since(
+                            "full_render.render_external_terminal_virtual",
+                            render_started,
                         );
-                        broken_clients.push(client_id);
-                        continue;
-                    };
-                    let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_terminal_virtual(runtime, area);
-                    crate::render_prof::duration_since(
-                        "full_render.render_terminal_virtual",
-                        render_started,
-                    );
-                    let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks = runtime.visible_hyperlinks(area);
-                    crate::render_prof::duration_since(
-                        "full_render.visible_hyperlinks",
-                        hyperlinks_started,
-                    );
-                    let frame_started = crate::render_prof::timer();
-                    let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
-                        cursor,
-                        &hyperlinks,
-                    );
-                    crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                        let (buffer, cursor, hyperlinks, _) = match rendered {
+                            Ok(rendered) => rendered,
+                            Err(error) => {
+                                warn!(
+                                    client_id,
+                                    terminal_id = %terminal_id,
+                                    %error,
+                                    "external terminal render failed"
+                                );
+                                self.send_to_client(
+                                    client_id,
+                                    ServerMessage::ServerShutdown {
+                                        reason: Some(format!(
+                                            "terminal render failed: terminal {terminal_id}"
+                                        )),
+                                    },
+                                );
+                                broken_clients.push(client_id);
+                                continue;
+                            }
+                        };
+                        let frame_started = crate::render_prof::timer();
+                        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+                            &buffer,
+                            cursor,
+                            &hyperlinks,
+                        );
+                        crate::render_prof::duration_since(
+                            "full_render.frame_build",
+                            frame_started,
+                        );
+                        frame
+                    } else {
+                        let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id)
+                        else {
+                            self.send_to_client(
+                                client_id,
+                                ServerMessage::ServerShutdown {
+                                    reason: Some(format!(
+                                        "terminal attach ended: terminal {terminal_id} not found"
+                                    )),
+                                },
+                            );
+                            broken_clients.push(client_id);
+                            continue;
+                        };
+                        let render_started = crate::render_prof::timer();
+                        let (buffer, cursor) =
+                            crate::server::render_stream::render_terminal_virtual(runtime, area);
+                        crate::render_prof::duration_since(
+                            "full_render.render_terminal_virtual",
+                            render_started,
+                        );
+                        let hyperlinks_started = crate::render_prof::timer();
+                        let hyperlinks = runtime.visible_hyperlinks(area);
+                        crate::render_prof::duration_since(
+                            "full_render.visible_hyperlinks",
+                            hyperlinks_started,
+                        );
+                        let frame_started = crate::render_prof::timer();
+                        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+                            &buffer,
+                            cursor,
+                            &hyperlinks,
+                        );
+                        crate::render_prof::duration_since(
+                            "full_render.frame_build",
+                            frame_started,
+                        );
+                        frame
+                    }
                 }
             };
 
@@ -589,7 +642,7 @@ impl HeadlessServer {
                 crate::protocol::MAX_FRAME_SIZE
             };
             let mut shell_assets_deferred = false;
-            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
+            let serialized = match client.surface_codec.frame(prepared.message(), max) {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -602,7 +655,10 @@ impl HeadlessServer {
                     }
                     next_shell_graphics_delivery = None;
                     shell_assets_deferred = true;
-                    match Self::frame_server_message(prepared.message()) {
+                    match client
+                        .surface_codec
+                        .frame(prepared.message(), MAX_FRAME_SIZE)
+                    {
                         Ok(framed) => framed,
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to serialize pane surface without assets");

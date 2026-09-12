@@ -16,6 +16,8 @@ pub struct EventsSubscribeParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum Subscription {
+    #[serde(rename = "worktree.cleanup")]
+    WorktreeCleanup {},
     #[serde(rename = "workspace.created")]
     WorkspaceCreated {},
     #[serde(rename = "workspace.updated")]
@@ -192,6 +194,7 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    WorktreeCleanup,
     WorkspaceCreated,
     WorkspaceUpdated,
     WorkspaceMetadataUpdated,
@@ -223,6 +226,7 @@ pub enum EventKind {
 impl EventKind {
     pub fn dot_name(self) -> &'static str {
         match self {
+            EventKind::WorktreeCleanup => "worktree.cleanup",
             EventKind::WorkspaceCreated => "workspace.created",
             EventKind::WorkspaceUpdated => "workspace.updated",
             EventKind::WorkspaceMetadataUpdated => "workspace.metadata_updated",
@@ -420,6 +424,11 @@ pub struct PaneScrollChangedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    WorktreeCleanup {
+        generation: u64,
+        records: Vec<serde_json::Value>,
+        diagnostic: Option<String>,
+    },
     WorkspaceCreated {
         workspace: WorkspaceInfo,
     },

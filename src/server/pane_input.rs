@@ -214,6 +214,163 @@ pub(super) fn apply_client_popup_input_events(
     apply_client_terminal_input_events(runtime, events, false)
 }
 
+/// Encode pane events for a checkpoint-backed external terminal.
+///
+/// External models do not expose Herdr's native Ghostty keyboard protocol, so
+/// the negotiated checkpoint mode is intentionally translated to the legacy
+/// terminal byte contract.  Host scrollback is handled by the headless server
+/// when mouse reporting is disabled; when the child requested mouse reporting,
+/// wheel/button/motion events are encoded for the child instead. Unsupported
+/// host-only events are ignored rather than being reinterpreted as terminal
+/// bytes.
+pub(super) fn encode_external_client_input(
+    session: &crate::terminal::external::ExternalTerminalSession,
+    events: &[ClientPaneInputEvent],
+) -> Result<Vec<u8>, String> {
+    let snapshot = session
+        .render_snapshot()
+        .map_err(|error| error.to_string())?;
+    let modes = snapshot.modes;
+    let columns = snapshot.columns;
+    let rows = snapshot.screen_lines;
+    let mouse_encoding = if modes.sgr_pixel_mouse {
+        crate::input::MouseProtocolEncoding::SgrPixels
+    } else {
+        crate::input::MouseProtocolEncoding::Default
+    };
+    let mut bytes = Vec::new();
+    for event in events {
+        if let ClientPaneInputEvent::Mouse {
+            kind,
+            position,
+            geometry,
+            modifiers,
+            ..
+        } = event
+        {
+            let (column, row) = match position {
+                crate::protocol::ClientMousePosition::Cell { column, row } => {
+                    if *column >= columns || *row >= rows {
+                        continue;
+                    }
+                    (*column, *row)
+                }
+                crate::protocol::ClientMousePosition::Pixels { x, y, column, row } => {
+                    if *column >= columns || *row >= rows {
+                        continue;
+                    }
+                    if geometry.is_some_and(|geometry| {
+                        *x == 0 || *y == 0 || *x > geometry.width_px || *y > geometry.height_px
+                    }) {
+                        continue;
+                    }
+                    if modes.sgr_pixel_mouse {
+                        (
+                            u16::try_from(*x).unwrap_or(u16::MAX),
+                            u16::try_from(*y).unwrap_or(u16::MAX),
+                        )
+                    } else {
+                        (*column, *row)
+                    }
+                }
+            };
+            let Some(encoded) = encode_external_mouse(
+                kind.to_crossterm(),
+                column,
+                row,
+                crossterm::event::KeyModifiers::from_bits_truncate(*modifiers),
+                modes.mouse,
+                mouse_encoding,
+            ) else {
+                continue;
+            };
+            bytes.extend(encoded);
+            continue;
+        }
+        match event.to_raw_input_event() {
+            crate::raw_input::RawInputEvent::Key(key) => {
+                bytes.extend(crate::input::encode_terminal_key(
+                    key,
+                    crate::input::KeyboardProtocol::Legacy,
+                ));
+            }
+            crate::raw_input::RawInputEvent::Text(text) => {
+                // TextCommit is already the host's composed text. Unlike a
+                // clipboard paste it must not acquire bracketed-paste framing.
+                bytes.extend_from_slice(text.as_str().as_bytes());
+            }
+            crate::raw_input::RawInputEvent::Paste(text) => {
+                append_external_text(&mut bytes, &text, modes.bracketed_paste);
+            }
+            crate::raw_input::RawInputEvent::Mouse(_) => unreachable!("mouse handled above"),
+            crate::raw_input::RawInputEvent::OuterFocusGained
+            | crate::raw_input::RawInputEvent::OuterFocusLost
+            | crate::raw_input::RawInputEvent::HostDefaultColor { .. }
+            | crate::raw_input::RawInputEvent::HostPaletteColors { .. }
+            | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
+            | crate::raw_input::RawInputEvent::HostCellSizeReport { .. }
+            | crate::raw_input::RawInputEvent::Unsupported => {}
+        }
+    }
+    if bytes.len() > 64 * 1024 {
+        return Err("external terminal input exceeded the bounded request size".to_owned());
+    }
+    Ok(bytes)
+}
+
+fn encode_external_mouse(
+    kind: crossterm::event::MouseEventKind,
+    column: u16,
+    row: u16,
+    modifiers: crossterm::event::KeyModifiers,
+    mode: crate::terminal::external::ExternalMouseMode,
+    encoding: crate::input::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    use crate::terminal::external::ExternalMouseMode;
+
+    let allowed = match kind {
+        crossterm::event::MouseEventKind::Down(_) | crossterm::event::MouseEventKind::Up(_) => {
+            !matches!(mode, ExternalMouseMode::None)
+        }
+        crossterm::event::MouseEventKind::Drag(_) => {
+            matches!(
+                mode,
+                ExternalMouseMode::CellMotion | ExternalMouseMode::AllMotion
+            )
+        }
+        crossterm::event::MouseEventKind::Moved => matches!(mode, ExternalMouseMode::AllMotion),
+        crossterm::event::MouseEventKind::ScrollUp
+        | crossterm::event::MouseEventKind::ScrollDown
+        | crossterm::event::MouseEventKind::ScrollLeft
+        | crossterm::event::MouseEventKind::ScrollRight => !matches!(mode, ExternalMouseMode::None),
+    };
+    if !allowed {
+        return None;
+    }
+    match kind {
+        crossterm::event::MouseEventKind::Moved => {
+            crate::input::encode_mouse_motion(kind, column, row, modifiers, encoding)
+        }
+        crossterm::event::MouseEventKind::ScrollUp
+        | crossterm::event::MouseEventKind::ScrollDown
+        | crossterm::event::MouseEventKind::ScrollLeft
+        | crossterm::event::MouseEventKind::ScrollRight => {
+            crate::input::encode_mouse_scroll(kind, column, row, modifiers, encoding)
+        }
+        _ => crate::input::encode_mouse_button(kind, column, row, modifiers, encoding),
+    }
+}
+
+fn append_external_text(bytes: &mut Vec<u8>, text: &str, bracketed: bool) {
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+    } else {
+        bytes.extend_from_slice(text.as_bytes());
+    }
+}
+
 fn apply_client_terminal_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
@@ -348,6 +505,72 @@ fn apply_client_terminal_input_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn external_test_session() -> crate::terminal::external::ExternalTerminalSession {
+        crate::terminal::external::ExternalTerminalSession::new(
+            coven_terminal::Geometry::new(20, 4),
+            coven_terminal::QueryReplyPolicy::Quiet,
+            1024 * 1024,
+            256,
+            herdr_external_terminal_integration_v1::ExternalTheme::default(),
+        )
+        .expect("external session")
+    }
+
+    #[test]
+    fn external_input_uses_checkpoint_modes_and_legacy_bytes() {
+        let session = external_test_session();
+        session
+            .ingest(coven_terminal::RawChunk::new(
+                coven_terminal::SessionCursor::START,
+                b"\x1b[?1000h\x1b[?1006h\x1b[?2004h".to_vec(),
+            ))
+            .expect("mode report");
+        let key = crate::protocol::ClientPaneInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char('c'),
+            modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+            kind: crate::protocol::ClientKeyKind::Press,
+            repeat_count: 1,
+            shifted_codepoint: None,
+            generated_text: None,
+            tracks_release: true,
+            physical_key_id: None,
+            windows_record: None,
+        };
+        let events = vec![
+            crate::protocol::ClientPaneInputEvent::TextCommit("typed".into()),
+            crate::protocol::ClientPaneInputEvent::Paste("clip".into()),
+            key,
+            crate::protocol::ClientPaneInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            },
+        ];
+        assert_eq!(
+            encode_external_client_input(&session, &events).expect("encoded input"),
+            b"typed\x1b[200~clip\x1b[201~\x03\x1b[<0;3;2M"
+        );
+    }
+
+    #[test]
+    fn external_input_drops_motion_without_a_matching_mouse_mode() {
+        let session = external_test_session();
+        let event = crate::protocol::ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Moved,
+            position: crate::protocol::ClientMousePosition::Cell { column: 2, row: 1 },
+            geometry: None,
+            modifiers: 0,
+            lines: 1,
+        };
+        assert!(encode_external_client_input(&session, &[event])
+            .expect("encoded input")
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn terminal_attach_stale_geometry_falls_back_to_the_canonical_cell() {

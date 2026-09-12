@@ -322,6 +322,19 @@ fn server_reload_agent_manifests_reports_runtime_override() {
     let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
+    // The socket is bound before App initialization finishes. An app-dispatched
+    // read proves startup has completed before this fixture creates its override,
+    // so the assertion below exercises reload rather than startup discovery.
+    let ready = send_request(
+        &socket_path,
+        r#"{"id":"app_ready","method":"workspace.list","params":{}}"#,
+    );
+    assert_eq!(ready["id"], "app_ready");
+    assert!(
+        ready.get("result").is_some(),
+        "app readiness failed: {ready}"
+    );
+
     let override_dir = config_home.join("herdr-dev").join("agent-detection");
     fs::create_dir_all(&override_dir).unwrap();
     let override_path = override_dir.join("codex.toml");

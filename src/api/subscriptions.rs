@@ -120,6 +120,7 @@ impl ActiveSubscription {
         };
 
         match subscription {
+            Subscription::WorktreeCleanup {} => Ok(event_subscription(EventKind::WorktreeCleanup)),
             Subscription::WorkspaceCreated {} => {
                 Ok(event_subscription(EventKind::WorkspaceCreated))
             }

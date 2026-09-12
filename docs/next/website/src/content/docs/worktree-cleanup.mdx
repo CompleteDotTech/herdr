@@ -1,0 +1,75 @@
+---
+title: Automatic worktree cleanup
+description: Let the background runtime remove verified merged worktrees and local branches across agents and tools.
+---
+
+Herdr's background runtime checks registered Git repositories for merged work. The cleanup action is programmatic: it does not call a model, send an agent a prompt, or depend on individual tools installing hooks. Worktrees created through ordinary Git commands are included.
+
+## When cleanup runs
+
+The runtime registers repositories opened by its sessions. It checks after startup, session ownership changes, detected Git reference changes, and periodically. Repeated requests are coalesced. Normal reconciliation runs at least every five minutes while the runtime is available; failures use bounded retry backoff up to one hour. Disconnecting a client leaves the runtime and cleanup service running.
+
+You can register another repository explicitly:
+
+```sh
+herdr worktree cleanup register /path/to/repository
+```
+
+Registration enables that repository's global automatic policy. Use a disabled global policy before registering repositories if you want to inspect them first.
+
+## What is eligible
+
+Cleanup fetches the configured integration branch, or resolves the current remote default branch. It verifies that each candidate commit is incorporated in that branch. For GitHub squash and rebase merges, the authenticated `gh` client must confirm a merged PR targeting that branch with the exact candidate source commit and an integrated merge commit. Unavailable or ambiguous evidence preserves the candidate.
+
+Primary checkouts, protected branches, locked worktrees, and explicit retention exceptions remain. Live and resumable sessions keep ownership even while agents are idle or clients are detached. Cleanup also preserves tracked changes, untracked and ignored files, submodules, unfinished Git operations, and index flags that could conceal changes.
+
+Automatic removal never stops agents, forces a worktree removal, deletes remote branches, or runs Git garbage collection. Branch deletion validates the expected commit immediately before deleting the local reference.
+
+Linux additionally checks process working directories and open file descriptors. If visibility is incomplete, the worktree is retained. Other platforms currently retain worktrees because complete process-use visibility is unavailable; verified, unused local branches can still be cleaned up. Repository locks coordinate participating runtimes, but arbitrary external filesystem writers do not honor those locks. Cleanup rechecks state and defers when it cannot establish safe ownership.
+
+## Inspect and request cleanup
+
+```sh
+herdr worktree cleanup inspect
+herdr worktree cleanup preview /path/to/repository
+herdr worktree cleanup run /path/to/repository
+```
+
+Omit the path to preview or reconcile all registered repositories. Preview evaluates eligibility without deleting worktrees or branches. It can fetch Git metadata and record its decisions.
+
+Commands print JSON. Mutating and preview commands wait for their queued operation, up to five minutes. A timeout leaves the operation pending; inspect its ID before retrying. A server restart invalidates runtime operation IDs, while durable repository records remain available on the next reconciliation.
+
+The result includes decisions, commit IDs, merge evidence, and reasons for retained items. Clients receive `worktree.cleanup` events, and attached clients receive a concise notification when resources are removed. Respecting notification preferences does not disable cleanup.
+
+## Policy and retention
+
+The global policy and registrations live in `cleanup/settings.json` under Herdr's configuration directory. Named sessions share this policy. Repository overrides replace the global policy for that repository.
+
+Write a policy JSON file, then apply it:
+
+```json
+{
+  "enabled": true,
+  "remote": "origin",
+  "integration_branch": null,
+  "protected_branches": ["main", "master", "develop", "development", "trunk"],
+  "retained_branches": ["release/keep-for-review"],
+  "retained_worktrees": [],
+  "github_merge_evidence": true
+}
+```
+
+```sh
+herdr worktree cleanup configure policy.json
+herdr worktree cleanup configure repository-policy.json /path/to/repository
+```
+
+Use canonical absolute paths for retained worktrees. Set `enabled` to `false` to disable automatic cleanup. Manual `run` also respects disablement; preview reports the policy's exclusions. Remove a retention exception and apply the policy again to permit later cleanup. Protected defaults apply when fields are omitted; specifying a list replaces that list.
+
+## API and recovery
+
+The separately advertised `worktree.cleanup` JSON API method accepts an `action`: `inspect`, `register`, `preview`, `reconcile`, or `configure`. Path-bearing actions use `repository`; configuration uses `policy`. Inspect returns the current snapshot. Other actions return `operation_id`; inspect the snapshot's `operations` until that ID is completed or failed. Check `boot_id` to detect a restarted runtime.
+
+Deletion intent and completed steps are stored in `herdr-cleanup/records.json` inside the repository's Git common directory. `herdr-cleanup/audit.jsonl` retains timestamped operation records. State is published durably before deletion. After a crash between worktree and branch removal, reconciliation checks actual Git state and verifies the surviving branch afresh. Reused names and recreated paths never inherit an earlier deletion decision.
+
+Commit IDs in the audit help diagnose operations; they do not guarantee recovery after later Git object expiration. Local-file and ownership exclusions remain pending until their conditions clear. Cleanup does not discard those files to make progress.
