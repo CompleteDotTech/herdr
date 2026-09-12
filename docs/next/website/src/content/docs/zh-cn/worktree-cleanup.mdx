@@ -1,0 +1,67 @@
+---
+title: 自动清理已合并 worktree
+description: 让后台运行时跨智能体和工具删除已验证的已合并 worktree 与本地分支。
+---
+
+Herdr 的后台运行时会检查已注册 Git 仓库中的已合并工作。清理完全以程序方式执行：不会调用模型、向智能体发送提示，或依赖各个工具安装钩子。通过普通 Git 命令创建的 worktree 也会被发现。
+
+## 清理何时运行
+
+运行时会注册会话打开的仓库，并在启动后、会话所有权变更时、检测到 Git 引用变更时及定期执行检查。重复请求会被合并。运行时可用期间，正常协调至少每五分钟执行一次；失败会采用有上限的退避重试，最长一小时。客户端断开后，运行时和清理服务仍会继续运行。
+
+也可以显式注册其他仓库：
+
+```sh
+herdr worktree cleanup register /path/to/repository
+```
+
+注册会为该仓库启用全局自动策略。如果想先检查仓库，请在注册前禁用全局策略。
+
+## 哪些内容符合删除条件
+
+清理会获取配置的集成分支，或解析当前远程默认分支，并验证候选提交已被该分支包含。对于 GitHub squash 或 rebase 合并，已认证的 `gh` 必须确认目标分支、精确的候选源提交和已并入的合并提交。证据不可用或有歧义时会保留候选项。
+
+主检出、受保护分支、已锁定 worktree 和显式保留例外都会被保留。实时或可恢复会话会维持所有权，即使智能体空闲或客户端已断开也是如此。清理还会保留已跟踪修改、未跟踪与被忽略文件、子模块、未完成 Git 操作以及可能隐藏修改的索引标志。
+
+自动删除不会停止智能体、强制删除 worktree、删除远程分支或运行 Git 垃圾回收。本地分支会在删除前立即验证预期提交。
+
+Linux 还会检查进程工作目录和打开的文件描述符。可见性不完整时会保留 worktree。其他平台无法获得完整的进程使用可见性，因此会保留 worktree；已验证且未使用的本地分支仍可清理。仓库锁会协调参与的运行时，但任意外部文件系统写入不会遵守这些锁；无法建立安全所有权时会延期。
+
+## 检查与请求清理
+
+```sh
+herdr worktree cleanup inspect
+herdr worktree cleanup preview /path/to/repository
+herdr worktree cleanup run /path/to/repository
+```
+
+省略路径会预览或协调所有已注册仓库。预览会评估资格但不删除 worktree 或分支；它可以获取 Git 元数据并记录决策。
+
+命令输出 JSON。变更和预览命令会等待已排队操作，最长五分钟。超时会保留待处理操作；重试前请检查其 ID。服务器重启会使运行时操作 ID 失效，但耐久的仓库记录会在下次协调时保留。
+
+结果包含决策、提交 ID、合并证据和保留原因。客户端会收到 `worktree.cleanup` 事件；删除资源时，已连接客户端会收到简洁通知。通知偏好不会禁用清理。
+
+## 策略与保留
+
+全局策略和注册信息保存在 Herdr 配置目录下的 `cleanup/settings.json`。命名会话共享该策略；仓库覆盖会替换该仓库的全局策略。
+
+编写并应用策略 JSON：
+
+```json
+{"enabled": true, "remote": "origin", "integration_branch": null, "protected_branches": ["main", "master", "develop", "development", "trunk"], "retained_branches": ["release/keep-for-review"], "retained_worktrees": [], "github_merge_evidence": true}
+```
+
+```sh
+herdr worktree cleanup configure policy.json
+herdr worktree cleanup configure repository-policy.json /path/to/repository
+```
+
+保留 worktree 请使用规范化绝对路径。将 `enabled` 设为 `false` 可关闭自动清理。手动 `run` 也遵守禁用状态，预览会报告策略排除项。移除保留例外并重新应用策略后，后续清理即可执行。省略字段时使用受保护默认值；指定列表会替换该列表。
+
+## API 与恢复
+
+单独公布的 `worktree.cleanup` JSON API 方法接受 `inspect`、`register`、`preview`、`reconcile` 或 `configure` 的 `action`。包含路径的操作使用 `repository`，配置使用 `policy`。inspect 返回当前快照；其他操作返回 `operation_id`，请检查快照中的 `operations`，直到该 ID 完成或失败。使用 `boot_id` 检测运行时重启。
+
+删除意图和已完成步骤存储在仓库 Git common directory 中的 `herdr-cleanup/records.json`。`herdr-cleanup/audit.jsonl` 保留带时间戳的操作记录。状态会在删除前以耐久方式发布。如果在 worktree 删除与分支删除之间崩溃，下次协调会检查实际 Git 状态，并重新验证幸存分支。被复用的名称和重新创建的路径不会继承早期删除决策。
+
+审计中的提交 ID 有助于诊断，但不能保证在 Git 对象后来过期后仍可恢复。本地文件和所有权排除项会保持待处理，直到条件消失。清理不会为了取得进展而丢弃这些文件。
