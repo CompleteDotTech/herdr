@@ -45,7 +45,9 @@ rustPlatform.buildRustPackage {
         ../src
         ../vendor/libghostty-vt
         ../vendor/libghostty-vt.vendor.json
+        ../vendor/alacritty-terminal-checkpoint
         ../vendor/portable-pty
+        ../vendor/vte-checkpoint
         ../build.rs
         ../Cargo.lock
         ../Cargo.toml
