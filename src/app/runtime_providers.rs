@@ -1719,6 +1719,47 @@ mod tests {
         }
     }
 
+    fn multi_provider_app(extra: &[&str]) -> App {
+        let mut app = action_app();
+        for (index, id) in extra.iter().enumerate() {
+            let suffix = index + 2;
+            let identity = ProviderIdentity::new(
+                ProviderId::new(*id).unwrap(),
+                SourceId::new(format!("host-{suffix}")).unwrap(),
+                ExecutionScope {
+                    project_id: ProjectId::new(format!("project-{suffix}")).unwrap(),
+                    profile_id: ProfileId::new(format!("profile-{suffix}")).unwrap(),
+                    policy_generation: 1,
+                },
+                ExecutionAuthority::new(
+                    AuthorityId::new(format!("authority-{suffix}")).unwrap(),
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            app.runtime_providers.settings.providers.push(
+                ProviderConfig::new(
+                    identity,
+                    std::env::temp_dir().join(format!("coven-home-{suffix}")),
+                    std::num::NonZeroUsize::new(2).unwrap(),
+                )
+                .unwrap()
+                .with_project_root(std::env::temp_dir())
+                .unwrap()
+                .with_actions_allowed(true),
+            );
+        }
+        app
+    }
+
+    fn attach_params(provider_id: &str) -> RuntimeProviderAttachParams {
+        RuntimeProviderAttachParams {
+            provider_id: provider_id.into(),
+            ..params()
+        }
+    }
+
     fn action_app() -> App {
         let mut app = app(true);
         let provider = app.runtime_providers.settings.providers[0]
@@ -1797,6 +1838,91 @@ mod tests {
         let unavailable = result(app.handle_runtime_provider_takeover("t".into(), target));
         assert_eq!(unavailable["error"]["code"], "control_unavailable");
         app.shutdown_terminal_runtime(terminal_id);
+    }
+
+    #[test]
+    fn one_provider_failure_does_not_stop_another_provider() {
+        // Two providers fail and one stays live. Asserting that BOTH failing
+        // providers are reconciled in a single poll is order-independent proof
+        // that the loop does not abort on the first failure; asserting that the
+        // live provider submitted a poll command proves it was still visited.
+        let mut app = multi_provider_app(&["second", "third"]);
+        for (request, provider) in [
+            ("a", "owner"),
+            ("b", "second"),
+            ("c", "third"),
+        ] {
+            let attached =
+                result(app.handle_runtime_provider_attach(request.into(), attach_params(provider)));
+            assert!(attached.get("error").is_none(), "{attached}");
+        }
+        assert_eq!(app.state.terminals.len(), 3);
+        let terminal_for = |app: &App, provider: &str| {
+            app.state
+                .terminals
+                .iter()
+                .find(|(_, terminal)| {
+                    terminal
+                        .external_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.execution.provider_id == provider)
+                })
+                .map(|(id, _)| id.clone())
+                .expect("provider attachment")
+        };
+        let owner_terminal = terminal_for(&app, "owner");
+        let second_terminal = terminal_for(&app, "second");
+        let third_terminal = terminal_for(&app, "third");
+        for terminal_id in [&owner_terminal, &second_terminal, &third_terminal] {
+            if let Some(terminal) = app.state.terminals.get_mut(terminal_id) {
+                terminal.external_observation = Some(ProviderObservation {
+                    lifecycle: crate::runtime_provider::ProviderLifecycle::Running,
+                    activity: crate::runtime_provider::ProviderActivity::Working,
+                    connection: ProviderConnection::Connected,
+                    durability: crate::runtime_provider::ProviderDurability::Durable,
+                    ..ProviderObservation::default()
+                });
+            }
+            let poll = app.runtime_providers.polls.get_mut(terminal_id).unwrap();
+            poll.pending = None;
+            poll.next_read = Instant::now();
+        }
+        // The first two providers fail; the third stays live.
+        app.terminal_runtimes
+            .external(&owner_terminal)
+            .unwrap()
+            .shutdown();
+        app.terminal_runtimes
+            .external(&second_terminal)
+            .unwrap()
+            .shutdown();
+        app.runtime_providers.refresh_deadline();
+        assert!(app.poll_runtime_providers(Instant::now()));
+
+        for terminal_id in [&owner_terminal, &second_terminal] {
+            assert!(app.runtime_providers.polls[terminal_id].stopped);
+            assert_eq!(
+                app.state.terminals[terminal_id]
+                    .external_observation
+                    .as_ref()
+                    .unwrap()
+                    .connection,
+                ProviderConnection::Disconnected
+            );
+        }
+        // The live provider was still visited: it submitted a poll command and
+        // its observation was not clobbered by the other providers' failures.
+        let third = &app.runtime_providers.polls[&third_terminal];
+        assert!(!third.stopped);
+        assert!(third.pending.is_some());
+        assert_eq!(
+            app.state.terminals[&third_terminal]
+                .external_observation
+                .as_ref()
+                .unwrap()
+                .connection,
+            ProviderConnection::Connected
+        );
     }
 
     #[test]
