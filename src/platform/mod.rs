@@ -3,6 +3,52 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+/// Cleanup needs affirmative visibility, not an Option conflating access denied
+/// with a vanished process. Unsupported visibility always defers removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Windows intentionally defers: only Unknown is constructible there.
+pub(crate) enum CleanupProcessUse {
+    Clear,
+    Active(u32),
+    Unknown(String),
+}
+
+#[cfg(unix)]
+pub(crate) fn cleanup_publish_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing state parent"))?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn cleanup_publish_file(
+    _source: &std::path::Path,
+    _destination: &std::path::Path,
+) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "durable cleanup state unsupported on this platform",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn cleanup_process_use(_path: &std::path::Path) -> CleanupProcessUse {
+    CleanupProcessUse::Unknown(
+        "complete process file-use visibility unavailable on this platform".into(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn cleanup_file_identity(path: &std::path::Path) -> Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let created = metadata.created().map_err(|e| e.to_string())?;
+    Ok(format!("{created:?}:{}", metadata.is_dir()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,

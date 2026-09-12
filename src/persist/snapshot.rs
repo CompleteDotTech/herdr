@@ -467,6 +467,7 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 }
 
 impl SessionSnapshot {
+    #[cfg(any(unix, test))]
     pub(crate) fn has_external_bindings(&self) -> bool {
         self.workspaces
             .iter()

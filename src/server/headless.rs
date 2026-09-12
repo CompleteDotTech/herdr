@@ -451,6 +451,18 @@ impl HeadlessServer {
                 needs_render = true;
                 needs_full_render = true;
             }
+            self.app.poll_cleanup(Instant::now());
+            if let Some(body) = self.app.take_cleanup_notice() {
+                self.handle_notification_show_api(
+                    "cleanup:notice".into(),
+                    api::schema::NotificationShowParams {
+                        title: "Merged work cleanup".into(),
+                        body: Some(body),
+                        position: None,
+                        sound: api::schema::NotificationShowSound::default(),
+                    },
+                );
+            }
 
             // 3. Drain API requests.
             if self.pane_graphics_runtime_active() {
@@ -1217,13 +1229,14 @@ impl HeadlessServer {
             return false;
         };
 
-        let (external_mouse_mode, external_alternate_screen, external_rows) =
-            match session.render_snapshot() {
-                Ok(snapshot) => (
-                    snapshot.modes.mouse,
-                    snapshot.modes.alternate_screen,
-                    i32::from(snapshot.screen_lines.max(1)),
-                ),
+        let (external_mouse_mode, external_alternate_screen, external_rows) = match session
+            .render_snapshot()
+        {
+            Ok(snapshot) => (
+                snapshot.modes.mouse,
+                snapshot.modes.alternate_screen,
+                i32::from(snapshot.screen_lines.max(1)),
+            ),
             Err(error) => {
                 warn!(client_id, terminal_id = %terminal_id, %error, "external shell input snapshot failed");
                 return false;
@@ -1242,29 +1255,28 @@ impl HeadlessServer {
                     if matches!(
                         external_mouse_mode,
                         crate::terminal::external::ExternalMouseMode::None
-                    ) => {
-                        local_scroll = match kind {
-                            protocol::ClientMouseKind::ScrollUp => {
-                                Some(-i32::from((*lines).max(1)))
-                            }
-                            protocol::ClientMouseKind::ScrollDown => {
-                                Some(i32::from((*lines).max(1)))
-                            }
-                            _ => None,
-                        };
-                    }
+                    ) =>
+                {
+                    local_scroll = match kind {
+                        protocol::ClientMouseKind::ScrollUp => Some(-i32::from((*lines).max(1))),
+                        protocol::ClientMouseKind::ScrollDown => Some(i32::from((*lines).max(1))),
+                        _ => None,
+                    };
+                }
                 protocol::ClientPaneInputEvent::Key {
                     code,
                     kind,
                     modifiers,
                     ..
                 } if matches!(
-                        external_mouse_mode,
-                        crate::terminal::external::ExternalMouseMode::None
-                    )
-                    && !external_alternate_screen
+                    external_mouse_mode,
+                    crate::terminal::external::ExternalMouseMode::None
+                ) && !external_alternate_screen
                     && *modifiers == 0
-                    && matches!(code, protocol::ClientKeyCode::PageUp | protocol::ClientKeyCode::PageDown) =>
+                    && matches!(
+                        code,
+                        protocol::ClientKeyCode::PageUp | protocol::ClientKeyCode::PageDown
+                    ) =>
                 {
                     local_scroll = match kind {
                         protocol::ClientKeyKind::Press | protocol::ClientKeyKind::Repeat => {
@@ -1330,16 +1342,19 @@ impl HeadlessServer {
         else {
             return changed;
         };
-        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+        let Some(runtime) = self
+            .app
+            .terminal_runtimes
+            .external(&real_terminal_id)
+            .cloned()
+        else {
             return changed;
         };
-        match runtime.submit(crate::runtime_provider::ProviderCommand::TerminalInput {
-            binding,
-            bytes,
-        }) {
+        match runtime
+            .submit(crate::runtime_provider::ProviderCommand::TerminalInput { binding, bytes })
+        {
             Ok(_) => {
-                self.terminal_attach_owners
-                    .insert(terminal_id, client_id);
+                self.terminal_attach_owners.insert(terminal_id, client_id);
                 session.reset_scroll();
                 self.app.render_dirty.request_generic();
                 true
@@ -1361,9 +1376,7 @@ impl HeadlessServer {
         terminal_id: String,
         data: Vec<u8>,
     ) -> bool {
-        if data.is_empty()
-            || self.terminal_attach_owners.get(&terminal_id) != Some(&client_id)
-        {
+        if data.is_empty() || self.terminal_attach_owners.get(&terminal_id) != Some(&client_id) {
             return false;
         }
         let Some(real_terminal_id) = self.terminal_id_by_string(&terminal_id) else {
@@ -1387,7 +1400,12 @@ impl HeadlessServer {
         else {
             return false;
         };
-        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+        let Some(runtime) = self
+            .app
+            .terminal_runtimes
+            .external(&real_terminal_id)
+            .cloned()
+        else {
             return false;
         };
         match runtime.submit(crate::runtime_provider::ProviderCommand::TerminalInput {
@@ -1437,7 +1455,12 @@ impl HeadlessServer {
         else {
             return false;
         };
-        let Some(runtime) = self.app.terminal_runtimes.external(&real_terminal_id).cloned() else {
+        let Some(runtime) = self
+            .app
+            .terminal_runtimes
+            .external(&real_terminal_id)
+            .cloned()
+        else {
             return false;
         };
         match runtime.submit_external_resize(
@@ -2261,13 +2284,8 @@ impl HeadlessServer {
             .external_session(&real_terminal_id)
             .is_some()
         {
-            let _ = self.handle_external_direct_resize(
-                client_id,
-                terminal_id,
-                rows,
-                cols,
-                cell_size,
-            );
+            let _ =
+                self.handle_external_direct_resize(client_id, terminal_id, rows, cols, cell_size);
         } else {
             self.app
                 .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);

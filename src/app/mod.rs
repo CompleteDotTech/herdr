@@ -13,6 +13,7 @@ mod api;
 pub(crate) use api::test_support::exiting_test_command;
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
+mod cleanup;
 mod creation;
 mod custom_commands;
 mod git_refresh;
@@ -107,6 +108,7 @@ impl AppPolicy {
 }
 
 pub struct App {
+    pub(crate) cleanup: cleanup::CleanupRuntime,
     pub state: AppState,
     pub(crate) pane_graphics: pane_graphics::Runtime,
     pub(crate) pane_graphics_files: Arc<crate::pane_graphics_files::FileStore>,
@@ -571,6 +573,7 @@ impl App {
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
         let mut app = Self {
+            cleanup: cleanup::CleanupRuntime::default(),
             config_diagnostic_deadline: None,
             toast_deadline: None,
             last_api_notification_at: None,

@@ -651,6 +651,7 @@ fn restore_tab(
                         master_fd: imported.master_fd,
                         state: imported.state.with_pane_id(*id),
                     },
+                    &cwd,
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,

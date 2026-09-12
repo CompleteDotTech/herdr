@@ -831,6 +831,7 @@ fn process_session_id(pid: u32) -> Option<i32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
@@ -1605,4 +1606,99 @@ mod tests {
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
     }
+}
+pub(crate) fn cleanup_file_identity(path: &std::path::Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    ))
+}
+
+pub(crate) fn cleanup_process_use(path: &std::path::Path) -> super::CleanupProcessUse {
+    use super::CleanupProcessUse;
+    use std::os::unix::fs::MetadataExt;
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+    };
+    let processes = match std::fs::read_dir("/proc") {
+        Ok(processes) => processes,
+        Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+    };
+    // Only clean owner-local worktrees, but inspect every visible process:
+    // ownership alone does not exclude another UID's cwd or open files.
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+    };
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if meta.uid() != uid {
+        return CleanupProcessUse::Unknown("worktree belongs to another user".into());
+    }
+    for entry in processes {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let proc_path = entry.path();
+        match std::fs::metadata(&proc_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+        }
+        let cwd = match std::fs::read_link(proc_path.join("cwd")) {
+            Ok(cwd) => cwd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A zombie has no cwd. A live process with unreadable cwd is unknown.
+                match std::fs::read_to_string(proc_path.join("stat")) {
+                    Ok(stat)
+                        if stat.rsplit_once(") ").is_some_and(|(_, tail)| {
+                            tail.starts_with("Z ") || tail.starts_with("X ")
+                        }) =>
+                    {
+                        continue
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    _ => {
+                        return CleanupProcessUse::Unknown(format!("process {pid} cwd unavailable"))
+                    }
+                }
+            }
+            Err(e) => return CleanupProcessUse::Unknown(format!("process {pid}: {e}")),
+        };
+        if cwd.starts_with(&path) {
+            return CleanupProcessUse::Active(pid);
+        }
+        let descriptors = match std::fs::read_dir(proc_path.join("fd")) {
+            Ok(fds) => fds,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return CleanupProcessUse::Unknown(format!("process {pid}: {e}")),
+        };
+        for fd in descriptors {
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(e) => return CleanupProcessUse::Unknown(e.to_string()),
+            };
+            match std::fs::read_link(fd.path()) {
+                Ok(target) if target.starts_with(&path) => return CleanupProcessUse::Active(pid),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return CleanupProcessUse::Unknown(format!("process {pid}: {e}")),
+            }
+        }
+    }
+    CleanupProcessUse::Clear
 }

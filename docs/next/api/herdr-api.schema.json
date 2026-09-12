@@ -83,6 +83,35 @@
           "oneOf": [
             {
               "properties": {
+                "diagnostic": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "records": {
+                  "items": true,
+                  "type": "array"
+                },
+                "type": {
+                  "const": "worktree_cleanup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "generation",
+                "records"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "workspace_created",
                   "type": "string"
@@ -728,6 +757,7 @@
         },
         "EventKind": {
           "enum": [
+            "worktree_cleanup",
             "workspace_created",
             "workspace_updated",
             "workspace_metadata_updated",
@@ -1222,6 +1252,101 @@
     },
     "request": {
       "$defs": {
+        "Action": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "inspect",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "register",
+                  "type": "string"
+                },
+                "repository": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action",
+                "repository"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "preview",
+                  "type": "string"
+                },
+                "repository": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "reconcile",
+                  "type": "string"
+                },
+                "repository": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "const": "configure",
+                  "type": "string"
+                },
+                "policy": {
+                  "$ref": "#/schemas/request/$defs/Policy"
+                },
+                "repository": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "action",
+                "policy"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -3877,6 +4002,59 @@
           ],
           "type": "object"
         },
+        "Policy": {
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "default": true,
+              "type": "boolean"
+            },
+            "github_merge_evidence": {
+              "default": true,
+              "type": "boolean"
+            },
+            "integration_branch": {
+              "default": null,
+              "description": "Branch name on `remote`; absent means resolve the live remote HEAD.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "protected_branches": {
+              "default": [
+                "main",
+                "master",
+                "develop",
+                "development",
+                "trunk"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "remote": {
+              "default": "origin",
+              "type": "string"
+            },
+            "retained_branches": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "retained_worktrees": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
         "PopupSize": {
           "oneOf": [
             {
@@ -4260,6 +4438,18 @@
         },
         "Subscription": {
           "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "worktree.cleanup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
             {
               "properties": {
                 "type": {
@@ -5039,6 +5229,22 @@
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "oneOf": [
+        {
+          "properties": {
+            "method": {
+              "const": "worktree.cleanup",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/Action"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "method": {
@@ -7273,6 +7479,35 @@
           "oneOf": [
             {
               "properties": {
+                "diagnostic": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "generation": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "records": {
+                  "items": true,
+                  "type": "array"
+                },
+                "type": {
+                  "const": "worktree_cleanup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "generation",
+                "records"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "workspace_created",
                   "type": "string"
@@ -7933,6 +8168,7 @@
         },
         "EventKind": {
           "enum": [
+            "worktree_cleanup",
             "workspace_created",
             "workspace_updated",
             "workspace_metadata_updated",
@@ -9702,6 +9938,28 @@
         },
         "ResponseResult": {
           "oneOf": [
+            {
+              "properties": {
+                "operation_id": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "snapshot": true,
+                "type": {
+                  "const": "worktree_cleanup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "snapshot"
+              ],
+              "type": "object"
+            },
             {
               "properties": {
                 "capabilities": {

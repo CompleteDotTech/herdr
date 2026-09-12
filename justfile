@@ -20,6 +20,10 @@ maintenance-test:
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
+# Cleanup policy, Git execution, worker, and real-runtime admission tests.
+cleanup-test:
+    cargo nextest run --locked -E 'test(cleanup::) | binary(cleanup)' --no-fail-fast --status-level fail --final-status-level fail --failure-output final --success-output never
+
 # Enforce deterministic UI hot-path architecture boundaries
 ui-hot-path-architecture-test:
     {{python}} -m unittest scripts.test_ui_hot_path_architecture

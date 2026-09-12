@@ -64,6 +64,8 @@ const RUNTIME_PROVIDER_METHODS: &[&str] = &[
     "runtime_provider.takeover",
 ];
 
+const CLEANUP_METHODS: &[&str] = &["worktree.cleanup"];
+
 pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {
     static ADVERTISED_METHODS: OnceLock<Vec<&'static str>> = OnceLock::new();
     ADVERTISED_METHODS
@@ -72,6 +74,7 @@ pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {
                 Vec::with_capacity(CLIENT_SHELL_METHODS.len() + RUNTIME_PROVIDER_METHODS.len());
             methods.extend_from_slice(CLIENT_SHELL_METHODS);
             methods.extend_from_slice(RUNTIME_PROVIDER_METHODS);
+            methods.extend_from_slice(CLEANUP_METHODS);
             methods.sort_unstable();
             methods.dedup();
             methods
@@ -80,7 +83,9 @@ pub(crate) fn supported_client_shell_method_names() -> &'static [&'static str] {
 }
 
 pub(crate) fn supports_client_shell_method_name(method: &str) -> bool {
-    CLIENT_SHELL_METHODS.contains(&method) || RUNTIME_PROVIDER_METHODS.contains(&method)
+    CLIENT_SHELL_METHODS.contains(&method)
+        || RUNTIME_PROVIDER_METHODS.contains(&method)
+        || CLEANUP_METHODS.contains(&method)
 }
 
 pub(crate) fn supports_client_shell_method(method: &Method) -> bool {
@@ -429,7 +434,7 @@ mod tests {
         assert!(advertised.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(
             advertised.len(),
-            CLIENT_SHELL_METHODS.len() + RUNTIME_PROVIDER_METHODS.len()
+            CLIENT_SHELL_METHODS.len() + RUNTIME_PROVIDER_METHODS.len() + CLEANUP_METHODS.len()
         );
         for method in RUNTIME_PROVIDER_METHODS {
             assert!(advertised.contains(method));

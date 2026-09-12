@@ -384,6 +384,7 @@ fn handle_request(
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
+        Method::WorktreeCleanup(_) => "worktree.cleanup",
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",

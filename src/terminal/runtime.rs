@@ -60,8 +60,11 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
+    // Mirrors the handoff constructor, including its persisted cwd fallback.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_handoff_fd(
         import: crate::handoff_runtime::ImportedHandoffRuntime,
+        persisted_cwd: &std::path::Path,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
@@ -71,6 +74,7 @@ impl TerminalRuntime {
     ) -> std::io::Result<Self> {
         crate::pane::PaneRuntime::from_handoff_fd(
             import,
+            persisted_cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
             host_terminal_appearance,

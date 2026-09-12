@@ -23,7 +23,8 @@ pub(super) struct CovenProviderClient {
     /// Test-only transport script for the terminal-control lease machine; the
     /// real path always goes through the daemon.
     #[cfg(test)]
-    scripted_control: Option<std::collections::VecDeque<Result<TerminalControlReply, ProviderFailure>>>,
+    scripted_control:
+        Option<std::collections::VecDeque<Result<TerminalControlReply, ProviderFailure>>>,
     #[cfg(test)]
     control_actions: Vec<TerminalControlAction>,
 }

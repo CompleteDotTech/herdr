@@ -969,23 +969,24 @@ mod tests {
         // channel from more than one place, so a ticket that is no longer the
         // latest must still reconcile from the retained snapshot instead of
         // freezing its poll forever.
-        let (handle, worker) = ProviderRuntime::start_worker(config(), |command, _| match command {
-            ProviderCommand::Health => ProviderOperationResult::Health(ProviderHealth {
-                ok: true,
-                api_version: "coven.daemon.v1".to_owned(),
-                coven_version: "fixture".to_owned(),
-                sessions: true,
-                events: true,
-                event_cursor: None,
-                structured_errors: true,
-                execution_request_contracts: Vec::new(),
-                execution_request_operations: Vec::new(),
-                execution_source_contracts: Vec::new(),
-                authority: None,
-            }),
-            _ => ProviderOperationResult::Source(observed_source()),
-        })
-        .unwrap();
+        let (handle, worker) =
+            ProviderRuntime::start_worker(config(), |command, _| match command {
+                ProviderCommand::Health => ProviderOperationResult::Health(ProviderHealth {
+                    ok: true,
+                    api_version: "coven.daemon.v1".to_owned(),
+                    coven_version: "fixture".to_owned(),
+                    sessions: true,
+                    events: true,
+                    event_cursor: None,
+                    structured_errors: true,
+                    execution_request_contracts: Vec::new(),
+                    execution_request_operations: Vec::new(),
+                    execution_source_contracts: Vec::new(),
+                    authority: None,
+                }),
+                _ => ProviderOperationResult::Source(observed_source()),
+            })
+            .unwrap();
         let first = handle.submit(ProviderCommand::Health).unwrap();
         let binding = handle
             .binding(ExecutionSessionId::new("session").unwrap(), 1)

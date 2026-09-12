@@ -29,6 +29,7 @@ const OPERATION_RETENTION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Default)]
 pub(crate) struct RuntimeProviders {
+    cleanup_admissions: HashMap<TerminalId, crate::cleanup::ownership::Admission>,
     settings: OwnerProviderSettings,
     diagnostic: Option<String>,
     polls: HashMap<TerminalId, PollState>,
@@ -142,6 +143,7 @@ struct OperationKey {
 }
 
 struct OperationState {
+    _cleanup_admission: Option<crate::cleanup::ownership::Admission>,
     provider_id: String,
     request_id: RequestId,
     ticket: crate::runtime_provider::OperationTicket,
@@ -220,6 +222,7 @@ impl RuntimeProviders {
         self.deadline
     }
     pub(crate) fn remove(&mut self, terminal_id: &TerminalId) {
+        self.cleanup_admissions.remove(terminal_id);
         self.polls.remove(terminal_id);
         self.refresh_deadline();
     }
@@ -295,6 +298,15 @@ impl App {
         if !binding.execution.matches_identity(&config.identity) {
             return Err("configured provider identity changed");
         }
+        let owned_cwd = self
+            .state
+            .terminals
+            .get(&binding.terminal_id)
+            .ok_or("provider terminal ownership missing")?
+            .cwd
+            .clone();
+        let cleanup_admission = crate::cleanup::ownership::admit_runtime(&owned_cwd)
+            .map_err(|_| "worktree cleanup ownership unavailable")?;
         let runtime = ProviderRuntime::start(config).map_err(|error| match error {
             crate::runtime_provider::ProviderStartError::WorkerLimitReached => {
                 "provider worker capacity is busy; retry after retiring workers exit"
@@ -309,6 +321,11 @@ impl App {
             .and_then(|fresh| fresh.with_pinned_source(binding.execution.pinned_source.clone()))
             .map_err(|_| "invalid runtime generation")?;
         let terminal_id = binding.terminal_id.clone();
+        if let Some(admission) = cleanup_admission {
+            self.runtime_providers
+                .cleanup_admissions
+                .insert(terminal_id.clone(), admission);
+        }
         self.terminal_runtimes
             .attach_external(terminal_id.clone(), runtime)?;
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
@@ -1197,6 +1214,18 @@ impl App {
                 }
             }
         };
+        let admission_path = match &intent {
+            ExecutionIntent::Launch { cwd, .. } => std::path::PathBuf::from(cwd),
+            _ => terminal_id
+                .as_ref()
+                .and_then(|id| self.state.terminals.get(id))
+                .map(|terminal| terminal.cwd.clone())
+                .unwrap_or_else(|| config.project_root().to_path_buf()),
+        };
+        let cleanup_admission = match crate::cleanup::ownership::admit_runtime(&admission_path) {
+            Ok(admission) => admission,
+            Err(error) => return encode_error(id, "worktree_busy", error.to_string()),
+        };
         let request = ExecutionRequest {
             contract: coven_client::execution::CONTRACT.to_owned(),
             request_id: request_id.clone(),
@@ -1283,6 +1312,7 @@ impl App {
                 request_id,
                 ticket,
                 payload_digest,
+                _cleanup_admission: cleanup_admission,
                 target,
                 binding,
                 terminal_id,
@@ -1401,6 +1431,7 @@ impl App {
                 request_id,
                 ticket,
                 payload_digest: params.payload_digest,
+                _cleanup_admission: None,
                 target,
                 binding,
                 terminal_id: None,
@@ -1847,11 +1878,7 @@ mod tests {
         // that the loop does not abort on the first failure; asserting that the
         // live provider submitted a poll command proves it was still visited.
         let mut app = multi_provider_app(&["second", "third"]);
-        for (request, provider) in [
-            ("a", "owner"),
-            ("b", "second"),
-            ("c", "third"),
-        ] {
+        for (request, provider) in [("a", "owner"), ("b", "second"), ("c", "third")] {
             let attached =
                 result(app.handle_runtime_provider_attach(request.into(), attach_params(provider)));
             assert!(attached.get("error").is_none(), "{attached}");

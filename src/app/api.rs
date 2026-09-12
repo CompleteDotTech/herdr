@@ -1063,6 +1063,7 @@ impl App {
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target);
             }
+            Method::WorktreeCleanup(action) => return self.handle_cleanup_api(request.id, action),
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {
                 let _ = params;

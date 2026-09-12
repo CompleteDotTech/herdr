@@ -260,10 +260,7 @@ pub(super) fn encode_external_client_input(
                         continue;
                     }
                     if geometry.is_some_and(|geometry| {
-                        *x == 0
-                            || *y == 0
-                            || *x > geometry.width_px
-                            || *y > geometry.height_px
+                        *x == 0 || *y == 0 || *x > geometry.width_px || *y > geometry.height_px
                     }) {
                         continue;
                     }
@@ -332,10 +329,14 @@ fn encode_external_mouse(
     use crate::terminal::external::ExternalMouseMode;
 
     let allowed = match kind {
-        crossterm::event::MouseEventKind::Down(_)
-        | crossterm::event::MouseEventKind::Up(_) => !matches!(mode, ExternalMouseMode::None),
+        crossterm::event::MouseEventKind::Down(_) | crossterm::event::MouseEventKind::Up(_) => {
+            !matches!(mode, ExternalMouseMode::None)
+        }
         crossterm::event::MouseEventKind::Drag(_) => {
-            matches!(mode, ExternalMouseMode::CellMotion | ExternalMouseMode::AllMotion)
+            matches!(
+                mode,
+                ExternalMouseMode::CellMotion | ExternalMouseMode::AllMotion
+            )
         }
         crossterm::event::MouseEventKind::Moved => matches!(mode, ExternalMouseMode::AllMotion),
         crossterm::event::MouseEventKind::ScrollUp
