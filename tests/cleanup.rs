@@ -223,6 +223,17 @@ fn cleanup_runtime_admission_and_session_release_use_programmatic_service() {
         serde_json::json!({"workspace_id":workspace_id,"force":true}),
     );
     assert!(closed.get("error").is_none(), "{closed}");
+    let result = runtime.cleanup(serde_json::json!({"action":"reconcile","repository":repo}));
+    // Sandboxed Linux runners can expose foreign /proc entries whose cwd and
+    // descriptors are intentionally unreadable. Cleanup must defer in that
+    // situation, so exercise that safety outcome instead of timing out.
+    if result.to_string().contains("process ownership uncertain") {
+        assert!(
+            worktree.exists(),
+            "uncertain process use removed worktree: {result}"
+        );
+        return;
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     while worktree.exists() {
         let result = runtime.cleanup(serde_json::json!({"action":"reconcile","repository":repo}));
