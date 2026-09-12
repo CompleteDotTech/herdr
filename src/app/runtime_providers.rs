@@ -970,17 +970,6 @@ impl App {
                 "provider attachment does not exist",
             );
         };
-        if self
-            .terminal_runtimes
-            .external_session(&terminal_id)
-            .is_none()
-        {
-            return encode_error(
-                id,
-                "control_unavailable",
-                "terminal control has not been negotiated for this attachment",
-            );
-        }
         let Some(binding) = self
             .state
             .terminals
@@ -994,6 +983,34 @@ impl App {
                 "provider attachment does not exist",
             );
         };
+        // A remote controller replacement is a permission-bearing action like
+        // execute: require the same owner-local opt-in so the shell command
+        // lane cannot reach it by configuration default.
+        match self
+            .runtime_providers
+            .config(&binding.execution.provider_id)
+            .is_some_and(|config| config.actions_allowed())
+        {
+            true => {}
+            false => {
+                return encode_error(
+                    id,
+                    "action_unavailable",
+                    "permission-bearing provider actions are not enabled by owner configuration",
+                );
+            }
+        }
+        if self
+            .terminal_runtimes
+            .external_session(&terminal_id)
+            .is_none()
+        {
+            return encode_error(
+                id,
+                "control_unavailable",
+                "terminal control has not been negotiated for this attachment",
+            );
+        }
         let Some(runtime) = self.terminal_runtimes.external(&terminal_id).cloned() else {
             return encode_error(id, "provider_unavailable", "provider worker is unavailable");
         };
@@ -1722,6 +1739,34 @@ mod tests {
         );
         assert_eq!(response["error"]["code"], "action_unavailable");
         assert!(app.runtime_providers.operations.is_empty());
+    }
+
+    #[test]
+    fn provider_takeover_requires_owner_opt_in_and_control() {
+        // Owner opt-in is checked before control negotiation, so a disabled
+        // provider action can never be reached through takeover.
+        let mut app = app(true);
+        let attached = result(app.handle_runtime_provider_attach("a".into(), params()));
+        assert!(attached.get("error").is_none(), "{attached}");
+        let terminal_id = app.state.terminals.keys().next().unwrap().clone();
+        let target = RuntimeProviderAttachmentTarget {
+            terminal_id: terminal_id.as_str().into(),
+        };
+        let rejected = result(app.handle_runtime_provider_takeover("t".into(), target.clone()));
+        assert_eq!(rejected["error"]["code"], "action_unavailable");
+        app.shutdown_terminal_runtime(terminal_id);
+
+        // With the owner opt-in enabled, the next gate is negotiated control.
+        let mut app = action_app();
+        let attached = result(app.handle_runtime_provider_attach("a".into(), params()));
+        assert!(attached.get("error").is_none(), "{attached}");
+        let terminal_id = app.state.terminals.keys().next().unwrap().clone();
+        let target = RuntimeProviderAttachmentTarget {
+            terminal_id: terminal_id.as_str().into(),
+        };
+        let unavailable = result(app.handle_runtime_provider_takeover("t".into(), target));
+        assert_eq!(unavailable["error"]["code"], "control_unavailable");
+        app.shutdown_terminal_runtime(terminal_id);
     }
 
     #[test]

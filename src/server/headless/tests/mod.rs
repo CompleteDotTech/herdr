@@ -6316,3 +6316,84 @@ fn no_handle_internal_event_bypass_in_module() {
         bypass_lines.join("\n  ")
     );
 }
+
+#[tokio::test]
+async fn client_shell_takeover_requires_terminal_control_ownership() {
+    // A takeover replaces the remote managed-terminal controller, so an
+    // observer shell client must be rejected before dispatch even though the
+    // method is in the client-shell lane allowlist.
+    let mut server = test_headless_server();
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    let client_id = 77;
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
+            client_id,
+            surface_cols: 80,
+            surface_rows: 23,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: true,
+            writer,
+        })
+    );
+    let _initial_snapshot = control_rx.recv().expect("initial shell snapshot");
+    let boot_id = server.client_shell_boot_id.clone();
+    let terminal_id = "managed-terminal".to_owned();
+    server
+        .terminal_attach_owners
+        .insert(terminal_id.clone(), client_id + 1);
+
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id,
+            boot_id: boot_id.clone(),
+            request: Box::new(api::schema::Request {
+                id: "client-shell:takeover".into(),
+                method: api::schema::Method::RuntimeProviderTakeover(
+                    api::schema::RuntimeProviderAttachmentTarget {
+                        terminal_id: terminal_id.clone(),
+                    },
+                ),
+            }),
+        })
+    );
+    // The gate responded immediately; the request never reached the app.
+    assert!(!server.clients[&client_id].shell_endpoint_command_in_flight);
+    let ServerMessage::ClientShellEndpointResponseChunk { data, .. } =
+        read_server_message(control_rx.recv().expect("takeover rejection"))
+    else {
+        panic!("expected takeover rejection response");
+    };
+    let response =
+        serde_json::from_slice::<api::schema::ErrorResponse>(&data).expect("typed rejection");
+    assert_eq!(response.error.code, "controller_required");
+
+    // The recorded owner passes the authority gate and reaches dispatch.
+    server
+        .terminal_attach_owners
+        .insert(terminal_id.clone(), client_id);
+    let _ = server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+        client_id,
+        boot_id,
+        request: Box::new(api::schema::Request {
+            id: "client-shell:takeover-owned".into(),
+            method: api::schema::Method::RuntimeProviderTakeover(
+                api::schema::RuntimeProviderAttachmentTarget { terminal_id },
+            ),
+        }),
+    });
+    assert!(server.clients[&client_id].shell_endpoint_command_in_flight);
+    let response_ready = server
+        .server_event_rx
+        .recv()
+        .await
+        .expect("endpoint response ready");
+    assert!(!server.handle_server_event(response_ready));
+    assert!(!server.clients[&client_id].shell_endpoint_command_in_flight);
+    let _ = control_rx.recv().expect("owner takeover response");
+}

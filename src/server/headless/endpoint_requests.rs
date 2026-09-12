@@ -76,6 +76,22 @@ impl HeadlessServer {
             return false;
         }
 
+        // A remote controller replacement must come from the client that
+        // currently controls this terminal. Observer shell clients may request
+        // other lane commands but not replace the managed controller; the
+        // owner-local API socket keeps its own access.
+        if let api::schema::Method::RuntimeProviderTakeover(target) = &request.method {
+            if self.terminal_attach_owners.get(&target.terminal_id) != Some(&client_id) {
+                let message = crate::server::client_commands::error_message(
+                    boot_id,
+                    request_id,
+                    "controller_required",
+                    "only the client controlling this terminal may request a provider takeover",
+                );
+                self.send_to_client(client_id, message);
+                return false;
+            }
+        }
         let api_request_id = format!(
             "endpoint:{}:{client_id}:{request_id}",
             self.client_shell_boot_id
