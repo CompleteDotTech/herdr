@@ -484,6 +484,23 @@ where
         .collect()
 }
 
+fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
+    match outcome {
+        Ok(cli::CommandOutcome::Handled(code)) => std::process::exit(code),
+        Ok(cli::CommandOutcome::NotCli) => Ok(()),
+        Err(err) if cli::protocol_mismatch_was_reported(&err) => std::process::exit(1),
+        Err(err) if cli::server_not_running_was_reported(&err) => {
+            if let Some(response) = cli::server_not_running_reported_response(&err) {
+                if let Ok(json) = serde_json::to_string(response) {
+                    eprintln!("{json}");
+                }
+            }
+            std::process::exit(1);
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn main() -> io::Result<()> {
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
@@ -493,6 +510,9 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
+        return finish_cli(outcome);
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -524,19 +544,10 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
 
-    match cli::maybe_run(&args) {
-        Ok(cli::CommandOutcome::Handled(code)) => std::process::exit(code),
-        Ok(cli::CommandOutcome::NotCli) => {}
-        Err(err) if cli::protocol_mismatch_was_reported(&err) => std::process::exit(1),
-        Err(err) if cli::server_not_running_was_reported(&err) => {
-            if let Some(response) = cli::server_not_running_reported_response(&err) {
-                if let Ok(json) = serde_json::to_string(response) {
-                    eprintln!("{json}");
-                }
-            }
-            std::process::exit(1);
-        }
-        Err(err) => return Err(err),
+    finish_cli(cli::maybe_run(&args))?;
+
+    if args.get(1).map(String::as_str) == Some("remote-api-bridge") {
+        return remote::run_remote_api_bridge(&args[2..]);
     }
 
     // Subcommands and flags (no TUI, no logging needed)
@@ -587,6 +598,7 @@ fn main() -> io::Result<()> {
         println!();
         println!("Usage: herdr [options]");
         println!("       herdr --session <name> [options]");
+        println!("       herdr --machine <label-or-id> <command>");
         println!("       herdr --remote <ssh-target> [--session <name>]");
         println!("       herdr session attach <name>");
         println!("       herdr completion zsh");
@@ -680,6 +692,7 @@ fn main() -> io::Result<()> {
         println!();
         println!("Options:");
         println!("  --session <name>    Use or create a named persistent session");
+        println!("  --machine <label-or-id>  Run an API command on a saved SSH machine");
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
         println!("  --remote-keybindings <local|server>");
         println!("                      Keybindings for --remote app attach (default: local)");
@@ -719,6 +732,7 @@ fn main() -> io::Result<()> {
     // Reject unknown flags
     let known_flags = [
         "--session",
+        "--machine",
         "--remote",
         "--remote-keybindings",
         "--version",

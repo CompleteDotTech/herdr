@@ -444,9 +444,13 @@ pub fn wait_for_message_variants(
     timeout: Duration,
     variants: &[u32],
 ) -> Result<bool, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
+    let read_timeout = Some(Duration::from_millis(200));
+    // Darwin can reject resetting the timeout after peer closure with queued data.
+    if stream.read_timeout().map_err(|e| e.to_string())? != read_timeout {
+        stream
+            .set_read_timeout(read_timeout)
+            .map_err(|e| e.to_string())?;
+    }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
@@ -749,17 +753,14 @@ fn runtime_dir_owner_alive(runtime_dir: &Path) -> bool {
     process_exists(owner_pid)
 }
 
-fn test_herdr_binary() -> Option<&'static Path> {
-    static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BINARY
+fn is_test_herdr_binary(path: &Path) -> bool {
+    // /proc resolves executable symlinks. Match only this Cargo build, including
+    // custom target directories; binary identity alone never grants ownership.
+    static TEST_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TEST_BINARY
         .get_or_init(|| fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).ok())
         .as_deref()
-}
-
-fn is_test_herdr_binary(path: &Path) -> bool {
-    // /proc resolves symlinks. Match exactly the executable Cargo built for
-    // this suite, including when CARGO_TARGET_DIR is outside the checkout.
-    test_herdr_binary().is_some_and(|binary| path == binary)
+        .is_some_and(|binary| path == binary)
 }
 
 extern "C" fn run_atexit_cleanup() {
@@ -882,26 +883,48 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_matcher_accepts_exact_cargo_binary() {
-        let binary = fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).unwrap();
+    fn watchdog_scoping_preserves_registered_live_owner() {
+        let runtime_dir = unique_missing_runtime_dir("live-owner");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            runtime_dir.join(RUNTIME_OWNER_MARKER),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let registered_runtime_dirs = HashSet::from([runtime_dir.clone()]);
+        let should_terminate = should_terminate_runtime_dir(&runtime_dir, &registered_runtime_dirs);
+        fs::remove_dir_all(runtime_dir).unwrap();
+        assert!(!should_terminate, "a live test owner must remain protected");
+    }
+
+    #[test]
+    fn test_binary_matcher_accepts_cargo_test_binary() {
+        let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_herdr"))
+            .expect("Cargo-built binary must exist");
         assert!(
             is_test_herdr_binary(&binary),
-            "exact Cargo binary should be considered test-owned"
+            "Cargo-built binary should be considered test-owned regardless of target directory"
         );
     }
 
     #[test]
-    fn test_binary_matcher_rejects_another_target_with_the_same_name() {
-        assert!(!is_test_herdr_binary(Path::new(
-            "/other-checkout/target/debug/herdr"
-        )));
-    }
-
-    #[test]
-    fn test_binary_matcher_rejects_installed_binary() {
-        assert!(
-            !is_test_herdr_binary(Path::new("/home/can/.local/bin/herdr")),
-            "installed binaries must not be considered test-owned"
-        );
+    fn test_binary_matcher_rejects_other_binaries() {
+        let nested_build = Path::new(env!("CARGO_MANIFEST_DIR")).join("other/target/debug/herdr");
+        let sibling_build = Path::new(env!("CARGO_BIN_EXE_herdr"))
+            .parent()
+            .unwrap()
+            .join("other-build/herdr");
+        for binary in [
+            Path::new("/home/can/.local/bin/herdr"),
+            Path::new("/tmp/other-checkout/target/debug/herdr"),
+            nested_build.as_path(),
+            sibling_build.as_path(),
+        ] {
+            assert!(
+                !is_test_herdr_binary(binary),
+                "other binaries must not be considered test-owned: {}",
+                binary.display()
+            );
+        }
     }
 }
