@@ -13,6 +13,7 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture {
+    _test_lock: Lease,
     dir: PathBuf,
     repo: Repository,
     policy: Policy,
@@ -20,6 +21,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        // nextest launches unit tests in separate processes. Serialize these
+        // Git worktree fixtures because their process-visibility assertions
+        // intentionally inspect process-wide state.
+        let test_lock = Lease::exclusive_wait(
+            &std::env::temp_dir().join("herdr-cleanup-fixtures-v1.lock"),
+            std::time::Duration::from_secs(120),
+        )
+        .unwrap();
         let dir = std::env::temp_dir().join(format!(
             "herdr-cleanup-{}-{}-{}",
             std::process::id(),
@@ -52,6 +61,7 @@ impl Fixture {
         );
         let repo = Repository::open(&root).unwrap();
         Self {
+            _test_lock: test_lock,
             dir,
             repo,
             policy: Policy {
