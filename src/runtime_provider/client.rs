@@ -20,6 +20,12 @@ pub(super) struct CovenProviderClient {
     checkpoint_connection: Option<super::checkpoint::CheckpointConnection>,
     control_identity: Option<TerminalControlIdentity>,
     control_lease: Option<ControlLease>,
+    /// Test-only transport script for the terminal-control lease machine; the
+    /// real path always goes through the daemon.
+    #[cfg(test)]
+    scripted_control: Option<std::collections::VecDeque<Result<TerminalControlReply, ProviderFailure>>>,
+    #[cfg(test)]
+    control_actions: Vec<TerminalControlAction>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +49,10 @@ impl CovenProviderClient {
             checkpoint_connection: None,
             control_identity: None,
             control_lease: None,
+            #[cfg(test)]
+            scripted_control: None,
+            #[cfg(test)]
+            control_actions: Vec::new(),
         }
     }
 
@@ -405,6 +415,91 @@ impl CovenProviderClient {
         )
     }
 
+    /// Return a usable control lease, renewing an about-to-expire one and
+    /// re-acquiring an expired one. `Acquire` only succeeds when no other
+    /// unexpired controller owns the terminal, so a renewal failure after an
+    /// idle gap is recovered without silently dropping the admitted mutation.
+    fn ensure_control_lease(
+        &mut self,
+        identity: &TerminalControlIdentity,
+    ) -> Result<ControlLease, ProviderFailure> {
+        if let Some(lease) = self.control_lease {
+            if lease.last_renewed.elapsed() < CONTROL_LEASE_RENEW_AFTER {
+                return Ok(lease);
+            }
+            let renewed = self.send_terminal_control(
+                identity.clone(),
+                TerminalControlAction::renew(lease.generation, CONTROL_LEASE_DURATION_MS),
+            );
+            match renewed {
+                Ok(reply) => {
+                    let TerminalControlOutcome::Renewed {
+                        lease_generation,
+                        next_mutation_seq,
+                    } = reply.outcome
+                    else {
+                        self.control_lease = None;
+                        return Err(ProviderFailure::new(
+                            ProviderFailureKind::Rejected,
+                            "Coven returned an unexpected terminal lease renewal response",
+                        ));
+                    };
+                    let lease = ControlLease {
+                        generation: lease_generation,
+                        next_mutation_seq,
+                        last_renewed: std::time::Instant::now(),
+                    };
+                    self.control_lease = Some(lease);
+                    return Ok(lease);
+                }
+                Err(error) => {
+                    self.control_lease = None;
+                    if self.control_identity.is_none() {
+                        // The transport was reset (disconnect or identity
+                        // mismatch) and the control identity dropped with it.
+                        // Re-acquiring from the stale clone would leave the
+                        // pending-mutation poll without an identity, so fail
+                        // closed instead of dispatching.
+                        return Err(error);
+                    }
+                    // The daemon rejected the renewal because the lease
+                    // expired while the worker was idle. Fall through to a
+                    // fresh acquire: a different unexpired controller still
+                    // fences us out, but our own expiry does not discard the
+                    // user's admitted mutation.
+                }
+            }
+        }
+        self.acquire_control_lease(identity)
+    }
+
+    fn acquire_control_lease(
+        &mut self,
+        identity: &TerminalControlIdentity,
+    ) -> Result<ControlLease, ProviderFailure> {
+        let acquired = self.send_terminal_control(
+            identity.clone(),
+            TerminalControlAction::acquire(CONTROL_LEASE_DURATION_MS),
+        )?;
+        let TerminalControlOutcome::Acquired {
+            lease_generation,
+            next_mutation_seq,
+        } = acquired.outcome
+        else {
+            return Err(ProviderFailure::new(
+                ProviderFailureKind::Rejected,
+                "Coven returned an unexpected terminal lease response",
+            ));
+        };
+        let lease = ControlLease {
+            generation: lease_generation,
+            next_mutation_seq,
+            last_renewed: std::time::Instant::now(),
+        };
+        self.control_lease = Some(lease);
+        Ok(lease)
+    }
+
     /// Acquire a lease only as part of a user-admitted mutation. The worker is
     /// the sole owner of lease and mutation sequencing, so concurrent UI
     /// requests cannot race or reuse a sequence. Unknown transport outcomes
@@ -432,61 +527,7 @@ impl CovenProviderClient {
             )
         })?;
         self.ensure_health()?;
-        if self.control_lease.is_none() {
-            let acquired = self.send_terminal_control(
-                identity.clone(),
-                TerminalControlAction::acquire(CONTROL_LEASE_DURATION_MS),
-            )?;
-            let TerminalControlOutcome::Acquired {
-                lease_generation,
-                next_mutation_seq,
-            } = acquired.outcome
-            else {
-                return Err(ProviderFailure::new(
-                    ProviderFailureKind::Rejected,
-                    "Coven returned an unexpected terminal lease response",
-                ));
-            };
-            self.control_lease = Some(ControlLease {
-                generation: lease_generation,
-                next_mutation_seq,
-                last_renewed: std::time::Instant::now(),
-            });
-        }
-        let mut lease = self.control_lease.expect("lease initialized above");
-        if lease.last_renewed.elapsed() >= CONTROL_LEASE_RENEW_AFTER {
-            let renewed = self.send_terminal_control(
-                identity.clone(),
-                TerminalControlAction::renew(lease.generation, CONTROL_LEASE_DURATION_MS),
-            );
-            let TerminalControlOutcome::Renewed {
-                lease_generation,
-                next_mutation_seq,
-            } = (match renewed {
-                Ok(reply) => reply.outcome,
-                Err(error) => {
-                    // The lease may have expired while the worker was idle.
-                    // Forget it before returning so the next explicit user
-                    // action can attempt a fresh acquire instead of reusing a
-                    // known-stale generation.
-                    self.control_lease = None;
-                    return Err(error);
-                }
-            })
-            else {
-                self.control_lease = None;
-                return Err(ProviderFailure::new(
-                    ProviderFailureKind::Rejected,
-                    "Coven returned an unexpected terminal lease renewal response",
-                ));
-            };
-            lease = ControlLease {
-                generation: lease_generation,
-                next_mutation_seq,
-                last_renewed: std::time::Instant::now(),
-            };
-            self.control_lease = Some(lease);
-        }
+        let lease = self.ensure_control_lease(&identity)?;
         let sequence = lease.next_mutation_seq;
         let action = match action {
             TerminalControlAction::Input { bytes, .. } => {
@@ -573,6 +614,16 @@ impl CovenProviderClient {
         identity: TerminalControlIdentity,
         action: TerminalControlAction,
     ) -> Result<TerminalControlReply, ProviderFailure> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted_control.as_mut() {
+            self.control_actions.push(action.clone());
+            return script.pop_front().unwrap_or_else(|| {
+                Err(ProviderFailure::new(
+                    ProviderFailureKind::Failed,
+                    "scripted terminal control is exhausted",
+                ))
+            });
+        }
         let request = coven_client::terminal_control::TerminalControlRequest::new(identity, action);
         let result = self.daemon().and_then(|daemon| {
             daemon
@@ -845,6 +896,139 @@ mod tests {
     use std::io;
 
     use super::*;
+
+    fn lease_config() -> super::super::ProviderConfig {
+        use coven_client::{
+            execution::{AuthorityId, ExecutionAuthority, ExecutionScope, ProfileId, ProjectId},
+            source::SourceId,
+        };
+        let identity = super::super::ProviderIdentity::new(
+            super::super::ProviderId::new("lease-fixture").unwrap(),
+            SourceId::new("host").unwrap(),
+            ExecutionScope {
+                project_id: ProjectId::new("project").unwrap(),
+                profile_id: ProfileId::new("profile").unwrap(),
+                policy_generation: 1,
+            },
+            ExecutionAuthority::new(AuthorityId::new("authority").unwrap(), 1).unwrap(),
+        )
+        .unwrap();
+        super::super::ProviderConfig::new(
+            identity,
+            std::path::PathBuf::from("/definitely/missing/coven-home"),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn lease_identity() -> TerminalControlIdentity {
+        TerminalControlIdentity {
+            session_id: "session".to_owned(),
+            stream_id: "stream".to_owned(),
+            stream_generation: 1,
+            execution_generation: 1,
+            authority_epoch: 1,
+            attachment_id: "attachment".to_owned(),
+        }
+    }
+
+    fn control_reply(outcome: TerminalControlOutcome) -> TerminalControlReply {
+        TerminalControlReply {
+            session_id: "session".to_owned(),
+            stream_id: "stream".to_owned(),
+            stream_generation: 1,
+            execution_generation: 1,
+            authority_epoch: 1,
+            attachment_id: "attachment".to_owned(),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn expired_lease_is_reacquired_instead_of_dropping_the_mutation() {
+        let identity = lease_identity();
+        let mut client = CovenProviderClient::new(lease_config());
+        client.control_identity = Some(identity.clone());
+        client.control_lease = Some(ControlLease {
+            generation: 7,
+            next_mutation_seq: 4,
+            last_renewed: std::time::Instant::now()
+                - CONTROL_LEASE_RENEW_AFTER
+                - std::time::Duration::from_secs(20),
+        });
+        client.scripted_control = Some(std::collections::VecDeque::from(vec![
+            Err(ProviderFailure::new(
+                ProviderFailureKind::Rejected,
+                "lease expired",
+            )),
+            Ok(control_reply(TerminalControlOutcome::Acquired {
+                lease_generation: 8,
+                next_mutation_seq: 1,
+            })),
+        ]));
+        let lease = client
+            .ensure_control_lease(&identity)
+            .expect("lease reacquired after expiry");
+        assert_eq!(lease.generation, 8);
+        assert_eq!(lease.next_mutation_seq, 1);
+        assert!(matches!(
+            client.control_actions[0],
+            TerminalControlAction::Renew {
+                lease_generation: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client.control_actions[1],
+            TerminalControlAction::Acquire { .. }
+        ));
+        assert_eq!(client.control_actions.len(), 2);
+    }
+
+    #[test]
+    fn disconnected_renewal_does_not_reacquire_without_an_identity() {
+        let identity = lease_identity();
+        let mut client = CovenProviderClient::new(lease_config());
+        // A disconnected send resets the client and clears the identity; the
+        // guard must then fail closed rather than re-acquire from the clone.
+        client.control_identity = None;
+        client.control_lease = Some(ControlLease {
+            generation: 7,
+            next_mutation_seq: 4,
+            last_renewed: std::time::Instant::now()
+                - CONTROL_LEASE_RENEW_AFTER
+                - std::time::Duration::from_secs(20),
+        });
+        client.scripted_control = Some(std::collections::VecDeque::from(vec![Err(
+            ProviderFailure::new(ProviderFailureKind::Disconnected, "transport lost"),
+        )]));
+        let error = client
+            .ensure_control_lease(&identity)
+            .expect_err("reset renewal must fail closed");
+        assert_eq!(error.kind, ProviderFailureKind::Disconnected);
+        assert_eq!(client.control_actions.len(), 1);
+        assert!(matches!(
+            client.control_actions[0],
+            TerminalControlAction::Renew { .. }
+        ));
+        assert!(client.control_lease.is_none());
+    }
+
+    #[test]
+    fn fresh_lease_is_used_without_a_renewal_round_trip() {
+        let identity = lease_identity();
+        let mut client = CovenProviderClient::new(lease_config());
+        client.control_identity = Some(identity.clone());
+        client.control_lease = Some(ControlLease {
+            generation: 3,
+            next_mutation_seq: 9,
+            last_renewed: std::time::Instant::now(),
+        });
+        let lease = client.ensure_control_lease(&identity).unwrap();
+        assert_eq!(lease.generation, 3);
+        assert_eq!(lease.next_mutation_seq, 9);
+        assert!(client.control_actions.is_empty());
+    }
 
     #[test]
     fn provider_failures_do_not_forward_owner_local_error_text() {
