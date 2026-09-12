@@ -115,6 +115,21 @@ impl Engine<'_> {
 
     fn evaluate_and_apply(&self, record: &mut Record, integration_branch: &str) -> Result<()> {
         let candidate = &record.candidate;
+        // Check the durable owner record before attempting the path lease. Some
+        // platforms coalesce advisory locks held by one process, so an in-process
+        // cleanup pass must still honour a live runtime admission.
+        let owned = self.ownership_reason(candidate)?;
+        let local = self.repository.local_reason(candidate)?;
+        if let Some(reason) = policy::retention_reason(
+            self.policy,
+            candidate,
+            integration_branch,
+            record.evidence.as_ref(),
+            owned.as_deref(),
+            local.as_deref(),
+        ) {
+            return Err(reason);
+        }
         let _path_lease = match &candidate.path {
             Some(path) => Some(Lease::exclusive(&ownership::path_lock(
                 self.ownership_root,
@@ -122,6 +137,8 @@ impl Engine<'_> {
             ))?),
             None => None,
         };
+        // Recheck after acquiring the lease so a concurrent admission cannot
+        // publish ownership between the initial read and a destructive action.
         let owned = self.ownership_reason(candidate)?;
         let local = self.repository.local_reason(candidate)?;
         if let Some(reason) = policy::retention_reason(
