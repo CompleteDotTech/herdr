@@ -5,7 +5,7 @@ use crate::{
     runtime_provider::{
         OwnerProviderSettings, ProviderCommand, ProviderConfig, ProviderConnection,
         ProviderFailureKind, ProviderObservation, ProviderOperation, ProviderOperationResult,
-        ProviderRuntime, ProviderRuntimeHandle,
+        ProviderRuntime, ProviderRuntimeHandle, SubmitError,
     },
     terminal::{backend::ExternalBinding, TerminalId},
 };
@@ -653,6 +653,36 @@ impl App {
                 };
                 match runtime.submit(command) {
                     Ok(ticket) => poll.pending = Some(ticket),
+                    Err(error @ (SubmitError::Disconnected | SubmitError::IdentityMismatch)) => {
+                        // The provider worker is gone (thread exit, panic or
+                        // local shutdown) or the binding is fenced. Reconcile
+                        // staleness explicitly instead of rendering the last
+                        // connected/working observation as current forever;
+                        // stop polling this attachment.
+                        poll.stopped = true;
+                        let diagnostic = match error {
+                            SubmitError::IdentityMismatch => {
+                                "provider binding changed; observation is stale"
+                            }
+                            _ => "provider worker is unavailable; observation is stale",
+                        };
+                        let snapshot = runtime.snapshot();
+                        let observation = ProviderObservation {
+                            lifecycle: snapshot.lifecycle,
+                            activity: snapshot.activity,
+                            connection: ProviderConnection::Disconnected,
+                            durability: snapshot.durability,
+                            diagnostic: Some(diagnostic.into()),
+                            writer_state: snapshot
+                                .source
+                                .as_ref()
+                                .map(|reply| reply.health.writer_state),
+                        };
+                        if terminal.external_observation.as_ref() != Some(&observation) {
+                            terminal.external_observation = Some(observation);
+                            changed = true;
+                        }
+                    }
                     Err(_) => {
                         poll.next_read = now + READ_INTERVAL;
                     }
@@ -1767,6 +1797,46 @@ mod tests {
         let unavailable = result(app.handle_runtime_provider_takeover("t".into(), target));
         assert_eq!(unavailable["error"]["code"], "control_unavailable");
         app.shutdown_terminal_runtime(terminal_id);
+    }
+
+    #[test]
+    fn dead_provider_worker_reconciles_stale_observation() {
+        let mut app = action_app();
+        let attached = result(app.handle_runtime_provider_attach("a".into(), params()));
+        assert!(attached.get("error").is_none(), "{attached}");
+        let terminal_id = app.state.terminals.keys().next().unwrap().clone();
+        // Leave behind the live-looking observation a running worker publishes.
+        if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+            terminal.external_observation = Some(ProviderObservation {
+                lifecycle: crate::runtime_provider::ProviderLifecycle::Running,
+                activity: crate::runtime_provider::ProviderActivity::Working,
+                connection: ProviderConnection::Connected,
+                durability: crate::runtime_provider::ProviderDurability::Durable,
+                ..ProviderObservation::default()
+            });
+        }
+        // The worker is gone, so the next poll cannot submit any command.
+        app.terminal_runtimes
+            .external(&terminal_id)
+            .unwrap()
+            .shutdown();
+        {
+            let poll = app.runtime_providers.polls.get_mut(&terminal_id).unwrap();
+            poll.pending = None;
+            poll.next_read = Instant::now();
+        }
+        app.runtime_providers.refresh_deadline();
+        assert!(app.poll_runtime_providers(Instant::now()));
+        let observation = app.state.terminals[&terminal_id]
+            .external_observation
+            .as_ref()
+            .expect("observation");
+        assert_eq!(observation.connection, ProviderConnection::Disconnected);
+        assert_eq!(
+            observation.diagnostic.as_deref(),
+            Some("provider worker is unavailable; observation is stale")
+        );
+        assert!(app.runtime_providers.polls[&terminal_id].stopped);
     }
 
     #[test]
