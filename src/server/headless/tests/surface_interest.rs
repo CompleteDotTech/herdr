@@ -282,6 +282,7 @@ async fn background_surface_activation_preserves_focused_viewer_geometry() {
     assert!(
         server.handle_server_event(ServerEvent::ClientShellConnected {
             client_id: 8,
+            surface_codec: crate::protocol::surface::SurfaceCodec::V1,
             surface_cols: 100,
             surface_rows: 35,
             cell_width_px: 0,
