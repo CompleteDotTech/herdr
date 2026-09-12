@@ -136,6 +136,7 @@ impl ProviderRuntime {
             health: None,
             source: None,
             last_operation: None,
+            retained_operations: std::collections::BTreeMap::new(),
             revision: 1,
             dropped_updates: 0,
         });
@@ -372,6 +373,7 @@ impl ProviderRuntimeHandle {
             snapshot.health = None;
             snapshot.source = None;
             snapshot.last_operation = None;
+            snapshot.retained_operations.clear();
         });
         Ok(next)
     }
@@ -386,6 +388,7 @@ impl ProviderRuntimeHandle {
             self.mutate_snapshot(|snapshot| {
                 snapshot.connection = ProviderConnection::Disconnected;
                 snapshot.last_operation = None;
+                snapshot.retained_operations.clear();
             });
             self.publish_locked(
                 None,
@@ -405,6 +408,7 @@ impl ProviderRuntimeHandle {
         self.mutate_snapshot(|snapshot| {
             snapshot.connection = ProviderConnection::Disconnected;
             snapshot.last_operation = None;
+            snapshot.retained_operations.clear();
         });
         self.publish_locked(
             None,
@@ -596,11 +600,25 @@ impl ProviderRuntimeHandle {
             }
         }
         if let Some(ticket) = ticket {
-            current.last_operation = Some(ProviderOperation {
+            let operation = ProviderOperation {
                 ticket,
                 kind,
                 result: result.clone(),
-            });
+            };
+            current.last_operation = Some(operation.clone());
+            // Retain settled results by ticket, oldest first, so that a
+            // consumer whose ticket is no longer the latest can still
+            // reconcile it. Pending entries are harmless and age out.
+            current.retained_operations.insert(ticket.raw(), operation);
+            while current.retained_operations.len() > super::RETAINED_OPERATION_RESULTS {
+                let oldest = current
+                    .retained_operations
+                    .keys()
+                    .next()
+                    .copied()
+                    .expect("retention map is non-empty here");
+                current.retained_operations.remove(&oldest);
+            }
         } else if !matches!(result, ProviderOperationResult::Pending { .. }) {
             current.last_operation = None;
         }
@@ -942,6 +960,82 @@ mod tests {
             Err(SubmitError::IdentityMismatch)
         );
         replacement.shutdown();
+    }
+
+    #[test]
+    fn settled_tickets_survive_a_destructive_shared_update_drain() {
+        // One runtime backs both the attachment poll and permission-bearing
+        // execution operations. The app layer drains the shared bounded update
+        // channel from more than one place, so a ticket that is no longer the
+        // latest must still reconcile from the retained snapshot instead of
+        // freezing its poll forever.
+        let (handle, worker) = ProviderRuntime::start_worker(config(), |command, _| match command {
+            ProviderCommand::Health => ProviderOperationResult::Health(ProviderHealth {
+                ok: true,
+                api_version: "coven.daemon.v1".to_owned(),
+                coven_version: "fixture".to_owned(),
+                sessions: true,
+                events: true,
+                event_cursor: None,
+                structured_errors: true,
+                execution_request_contracts: Vec::new(),
+                execution_request_operations: Vec::new(),
+                execution_source_contracts: Vec::new(),
+                authority: None,
+            }),
+            _ => ProviderOperationResult::Source(observed_source()),
+        })
+        .unwrap();
+        let first = handle.submit(ProviderCommand::Health).unwrap();
+        let binding = handle
+            .binding(ExecutionSessionId::new("session").unwrap(), 1)
+            .unwrap();
+        let second = handle
+            .submit(ProviderCommand::ReadSource {
+                binding,
+                cursor: None,
+                limit: 1,
+            })
+            .unwrap();
+        // Wait until both commands have settled, then let a competing consumer
+        // drain the entire shared channel before the ticket owner runs; the
+        // results must remain recoverable from the snapshot.
+        let deadline = std::time::Instant::now() + TEST_GUARD;
+        loop {
+            let settled = handle
+                .snapshot()
+                .operation_result(second)
+                .is_some_and(|operation| {
+                    !matches!(operation.result, ProviderOperationResult::Pending { .. })
+                });
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture worker did not publish its results"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        while !handle.try_drain_updates(64).is_empty() {}
+        let snapshot = handle.snapshot();
+        let first_result = snapshot
+            .operation_result(first)
+            .expect("superseded ticket was dropped");
+        assert!(matches!(
+            first_result.result,
+            ProviderOperationResult::Health(_)
+        ));
+        let second_result = snapshot
+            .operation_result(second)
+            .expect("latest ticket was dropped");
+        assert!(matches!(
+            second_result.result,
+            ProviderOperationResult::Source(_)
+        ));
+        assert!(snapshot.retained_operations.len() >= 2);
+        handle.shutdown();
+        worker.join().unwrap();
     }
 
     #[test]

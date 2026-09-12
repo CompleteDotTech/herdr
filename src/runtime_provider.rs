@@ -18,6 +18,7 @@ pub(crate) mod transcript_view;
 mod tests;
 
 use std::{
+    collections::BTreeMap,
     fmt,
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -39,6 +40,14 @@ pub(crate) use settings::OwnerProviderSettings;
 /// Hard cap for both the blocking command queue and the nonblocking update
 /// queue.  Callers may choose a smaller capacity for their workload.
 pub(crate) const MAX_PROVIDER_QUEUE_CAPACITY: usize = 256;
+
+/// Per-runtime retention bound for settled operation results.
+///
+/// A provider runtime can back both an attachment poll and one or more
+/// permission-bearing execution operations. The immutable snapshot retains the
+/// most recent result by ticket so that neither consumer can lose a result
+/// because the other drained the shared bounded update channel first.
+pub(crate) const RETAINED_OPERATION_RESULTS: usize = 16;
 
 // Health is an owner-local projection, so it must not retain arbitrary data
 // from a daemon response even though the transport has a larger body bound.
@@ -514,8 +523,30 @@ pub(crate) struct ProviderSnapshot {
     pub(crate) health: Option<ProviderHealth>,
     pub(crate) source: Option<SourceReply>,
     pub(crate) last_operation: Option<ProviderOperation>,
+    /// Bounded ticket-indexed retention of recent operation results. The
+    /// update channel is shared by every consumer of a runtime and is drained
+    /// destructively, so a ticket that is not the latest cannot be recovered
+    /// from `last_operation` alone. This map keeps reconciliation independent
+    /// of channel drain order and of channel overflow.
+    retained_operations: BTreeMap<u64, ProviderOperation>,
     pub(crate) revision: u64,
     pub(crate) dropped_updates: u64,
+}
+
+impl ProviderSnapshot {
+    /// Reconcile one ticket from the retained results, falling back to the
+    /// latest operation for backwards compatibility with callers that only
+    /// reason about the newest update.
+    pub(crate) fn operation_result(&self, ticket: OperationTicket) -> Option<ProviderOperation> {
+        self.retained_operations
+            .get(&ticket.raw())
+            .cloned()
+            .or_else(|| {
+                self.last_operation
+                    .clone()
+                    .filter(|operation| operation.ticket == ticket)
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

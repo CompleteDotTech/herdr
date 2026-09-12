@@ -375,13 +375,12 @@ impl App {
             };
             // Drain notifications to keep the channel bounded; the latest
             // snapshot remains authoritative even if notifications were dropped.
-            // The immutable snapshot intentionally contains only the latest
-            // operation. A terminal-control command can complete between a
-            // checkpoint read and this app-loop tick, replacing that latest
-            // value before the read ticket is reconciled. Consume the
-            // ticketed update first so observation polling cannot get stuck
-            // behind an unrelated control operation; retain the snapshot as
-            // the fallback when no matching update is available.
+            // The immutable snapshot retains a bounded ticket-indexed history
+            // of settled results, so a read ticket that is no longer the latest
+            // still reconciles. Consume the ticketed update first so observation
+            // polling cannot get stuck behind an unrelated control operation;
+            // retain the snapshot as the fallback when no matching update is
+            // available.
             let updates = runtime.try_drain_updates(64);
             let snapshot = runtime.snapshot();
             let pending_operation = poll.pending.and_then(|ticket| {
@@ -396,12 +395,7 @@ impl App {
                         kind: update.kind,
                         result: update.result.clone(),
                     })
-                    .or_else(|| {
-                        snapshot
-                            .last_operation
-                            .clone()
-                            .filter(|operation| operation.ticket == ticket)
-                    })
+                    .or_else(|| snapshot.operation_result(ticket))
             });
             if let Some(operation) = pending_operation.as_ref() {
                 if !matches!(operation.result, ProviderOperationResult::Pending { .. }) {
@@ -687,11 +681,22 @@ impl App {
         {
             operation.runtime.try_drain_updates(8);
             let snapshot = operation.runtime.snapshot();
-            let Some(last) = snapshot
-                .last_operation
-                .as_ref()
-                .filter(|last| last.ticket == operation.ticket)
-            else {
+            let Some(last) = snapshot.operation_result(operation.ticket) else {
+                // The bounded retention map can evict a settled ticket when
+                // many operations share one runtime. Re-submit the idempotent
+                // lookup (read-only, bound to the same request id, digest and
+                // target) so a lost ticket self-heals instead of freezing the
+                // operation forever.
+                if let Ok(ticket) = operation.runtime.submit(ProviderCommand::LookupExecution {
+                    binding: operation.binding.clone(),
+                    request_id: operation.request_id.clone(),
+                    expected_digest: operation.payload_digest.clone(),
+                    expected_target: operation.target.clone(),
+                }) {
+                    operation.ticket = ticket;
+                    operation.result = None;
+                    changed = true;
+                }
                 continue;
             };
             if matches!(last.result, ProviderOperationResult::Pending { .. }) {
